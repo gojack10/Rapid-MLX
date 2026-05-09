@@ -108,6 +108,10 @@ class DFlashMlxEngine(BatchedEngine):
             memory_waterfall=bool(getattr(cfg, "memory_waterfall", False)),
             bench_log_dir=getattr(cfg, "bench_log_dir", "") or "",
             verify_mode=getattr(cfg, "verify_mode", None),
+            speculative_mode=getattr(cfg, "speculative_mode", None),
+            ddtree_budget=getattr(cfg, "ddtree_budget", None),
+            ddtree_topk=getattr(cfg, "ddtree_topk", None),
+            ddtree_dense_mask=getattr(cfg, "ddtree_dense_mask", None),
         )
 
         diagnostics_mode = getattr(cfg, "diagnostics", "off") or "off"
@@ -148,9 +152,10 @@ class DFlashMlxEngine(BatchedEngine):
 
         rc = self._runtime_context.runtime
         logger.info(
-            "[DFlash-MLX] Config: profile=%s verify=%s draft_sink=%s draft_window=%s "
+            "[DFlash-MLX] Config: profile=%s verify=%s speculative=%s draft_sink=%s draft_window=%s "
             "prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s prefill_step=%s",
             getattr(rc, "profile", "balanced"), getattr(rc, "verify_mode", "auto"),
+            getattr(rc, "speculative_mode", "dflash"),
             getattr(rc, "draft_sink_size", 64), getattr(rc, "draft_window_size", 1024),
             getattr(rc, "prefix_cache", False),
             getattr(rc, "prefix_cache_max_entries", 4), getattr(rc, "prefix_cache_max_bytes", 0),
