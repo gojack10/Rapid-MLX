@@ -439,15 +439,16 @@ class DFlashMlxEngine(BatchedEngine):
         except Exception as exc:
             return f"<decode failed: {exc}>"
         text = text.replace("\n", "\\n")
-        if len(text) > 700:
-            text = text[:700] + "…"
+        if len(text) > 1400:
+            text = text[:1400] + "…"
         return text
 
     def _log_prefix_divergence(self, tokenizer, lookup_tokens, snap, common: int, eid: Any) -> None:
         cached_tokens = snap.token_ids
-        start = max(0, common - 40)
-        lookup_end = min(len(lookup_tokens), common + 40)
-        cached_end = min(len(cached_tokens), common + 40)
+        window = 50  # ~100 tokens centered on the first mismatch.
+        start = max(0, common - window)
+        lookup_end = min(len(lookup_tokens), common + window)
+        cached_end = min(len(cached_tokens), common + window)
         lookup_next = lookup_tokens[common] if common < len(lookup_tokens) else None
         cached_next = cached_tokens[common] if common < len(cached_tokens) else None
         logger.info(
@@ -466,6 +467,21 @@ class DFlashMlxEngine(BatchedEngine):
             start, cached_end,
             self._decode_debug_tokens(tokenizer, cached_tokens[start:cached_end]),
         )
+        probe = 20_000
+        if common >= probe and len(lookup_tokens) > probe and len(cached_tokens) > probe:
+            probe_start = max(0, probe - window)
+            probe_lookup_end = min(len(lookup_tokens), probe + window)
+            probe_cached_end = min(len(cached_tokens), probe + window)
+            logger.info(
+                "[DFlash-MLX] lookup text around token~20K [%d:%d]: %s",
+                probe_start, probe_lookup_end,
+                self._decode_debug_tokens(tokenizer, lookup_tokens[probe_start:probe_lookup_end]),
+            )
+            logger.info(
+                "[DFlash-MLX] cached text around token~20K [%d:%d]: %s",
+                probe_start, probe_cached_end,
+                self._decode_debug_tokens(tokenizer, cached_tokens[probe_start:probe_cached_end]),
+            )
 
     def _count_prompt_tokens(self, prompt):
         t = self._tokenizer
