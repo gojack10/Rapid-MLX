@@ -137,12 +137,12 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
             supports_spec_decode=False,
         ),
     ),
-    # Qwen3.6 — hybrid GatedDeltaNet, XML tool format
+    # Qwen3.6 — hybrid GatedDeltaNet, XML tool format, <thinking> tags
     (
         re.compile(r"qwen3\.6", re.IGNORECASE),
         ModelConfig(
             tool_call_parser="qwen3_coder_xml",
-            reasoning_parser="qwen3",
+            reasoning_parser="qwen3_6",
             is_hybrid=True,
             supports_spec_decode=False,
         ),
