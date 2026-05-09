@@ -310,6 +310,8 @@ def serve_command(args):
         server._default_top_p = args.default_top_p
     if args.default_top_k is not None:
         server._default_top_k = args.default_top_k
+    if args.drafter is not None:
+        server._drafter_path = args.drafter
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -530,6 +532,7 @@ def serve_command(args):
             cloud_api_key=args.cloud_api_key,
             served_model_name=args.served_model_name,
             mtp=args.enable_mtp,
+            drafter_path=args.drafter,
         )
     except Exception as e:
         # Show clean error instead of raw traceback. Catch the typed
@@ -2213,6 +2216,14 @@ Examples:
         default=0,
         help="Max prefill tokens per scheduler step (0=disabled). "
         "Prevents starvation of active requests during long prefills.",
+    )
+    # DFlash-MLX speculative decoding
+    serve_parser.add_argument(
+        "--drafter",
+        type=str,
+        default=None,
+        help="Path to DFlash drafter checkpoint for speculative decoding "
+        "(requires dflash-mlx package). E.g. /path/to/Qwen3.6-27B-DFlash",
     )
     # MTP (Multi-Token Prediction)
     serve_parser.add_argument(

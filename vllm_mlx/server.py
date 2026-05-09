@@ -174,6 +174,7 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _default_top_k: int | None = None  # Set via --default-top-k
+_drafter_path: str | None = None  # Set via --drafter
 
 # Global MCP manager
 _mcp_manager = None
@@ -476,6 +477,7 @@ def load_model(
     cloud_api_key: str | None = None,
     served_model_name: str | None = None,
     mtp: bool = False,
+    drafter_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -522,15 +524,32 @@ def load_model(
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
 
-    logger.info(f"Loading model with BatchedEngine: {model_name}")
-    _engine = BatchedEngine(
-        model_name=model_name,
-        scheduler_config=scheduler_config,
-        stream_interval=stream_interval,
-        force_mllm=force_mllm,
-        gpu_memory_utilization=gpu_memory_utilization,
-    )
-    logger.info(f"Model loaded: {model_name}")
+    if drafter_path:
+        from .engine.dflash_mlx import DFlashMlxEngine
+
+        logger.info(
+            f"Loading model with DFlashMlxEngine: {model_name}  "
+            f"drafter={drafter_path}"
+        )
+        _engine = DFlashMlxEngine(
+            model_name=model_name,
+            drafter_path=drafter_path,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval,
+            force_mllm=force_mllm,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        logger.info(f"Model loaded (DFlash-MLX): {model_name}")
+    else:
+        logger.info(f"Loading model with BatchedEngine: {model_name}")
+        _engine = BatchedEngine(
+            model_name=model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval,
+            force_mllm=force_mllm,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        logger.info(f"Model loaded: {model_name}")
 
     # Sync globals into ServerConfig BEFORE _detect_native_tool_support reads
     # them via get_config(). Detection short-circuits when cfg.tool_call_parser
@@ -772,6 +791,13 @@ Examples:
     )
     parser.add_argument("--kv-group-size", type=int, default=64, help=_ap.SUPPRESS)
     parser.add_argument("--draft-model", type=str, default=None, help=_ap.SUPPRESS)
+    parser.add_argument(
+        "--drafter",
+        type=str,
+        default=None,
+        help="Path to DFlash drafter checkpoint for speculative decoding "
+        "(requires dflash-mlx package). E.g. /path/to/Qwen3.6-27B-DFlash",
+    )
     parser.add_argument("--num-draft-tokens", type=int, default=4, help=_ap.SUPPRESS)
     # TurboQuant flags — accepted but only functional via rapid-mlx serve (cli.py)
     parser.add_argument("--kv-cache-turboquant", action="store_true", help=_ap.SUPPRESS)
@@ -1007,6 +1033,10 @@ Examples:
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
+    # Set drafter global before loading (load_model reads _drafter_path)
+    global _drafter_path
+    _drafter_path = args.drafter
+
     # Load model before starting server
     load_model(
         args.model,
@@ -1017,6 +1047,7 @@ Examples:
         cloud_threshold=args.cloud_threshold,
         cloud_api_base=args.cloud_api_base,
         cloud_api_key=args.cloud_api_key,
+        drafter_path=args.drafter,
     )
 
     # Start server
