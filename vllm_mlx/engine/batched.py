@@ -790,6 +790,13 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
+        # Compute prefix boundary for cache
+        prefix_boundary = self._compute_prefix_boundary(
+            messages, tools, enable_thinking=enable_thinking
+        )
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
+
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -801,7 +808,10 @@ class BatchedEngine(BaseEngine):
         )
 
     def _compute_prefix_boundary(
-        self, messages: list[dict[str, Any]], tools: list[dict] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        enable_thinking: bool | None = None,
     ) -> int:
         """Compute token count for the shared prefix across message variations.
 
@@ -823,7 +833,9 @@ class BatchedEngine(BaseEngine):
             template_tools = convert_tools_for_template(tools) if tools else None
 
             # Tokenize the real prompt
-            real_prompt = self._apply_chat_template(messages, template_tools)
+            real_prompt = self._apply_chat_template(
+                messages, template_tools, enable_thinking=enable_thinking
+            )
 
             # Build a dummy variant with different last user content
             dummy_messages = list(messages)
@@ -831,7 +843,9 @@ class BatchedEngine(BaseEngine):
                 **messages[last_user_idx],
                 "content": "XXXXXXXXXX",
             }
-            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+            dummy_prompt = self._apply_chat_template(
+                dummy_messages, template_tools, enable_thinking=enable_thinking
+            )
 
             tokenizer = self.tokenizer
             if hasattr(tokenizer, "tokenizer"):
@@ -906,7 +920,9 @@ class BatchedEngine(BaseEngine):
         )
 
         # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        prefix_boundary = self._compute_prefix_boundary(
+            messages, tools, enable_thinking=enable_thinking
+        )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
 
