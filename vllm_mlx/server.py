@@ -129,6 +129,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _parse_byte_size(raw: str) -> int:
+    import argparse as _argparse
+    import re
+    value = str(raw).strip().lower()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?|bytes?)?", value)
+    if match is None:
+        raise _argparse.ArgumentTypeError("expected byte value like 8GB")
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    multipliers = {"":1,"b":1,"byte":1,"bytes":1,"k":1024,"kb":1024,"kib":1024,"m":1024**2,"mb":1024**2,"mib":1024**2,"g":1024**3,"gb":1024**3,"gib":1024**3,"t":1024**4,"tb":1024**4,"tib":1024**4}
+    return int(number * multipliers[unit])
+
+
 def normalize_log_level(log_level: str) -> str:
     return log_level.upper()
 
@@ -478,6 +491,7 @@ def load_model(
     served_model_name: str | None = None,
     mtp: bool = False,
     drafter_path: str | None = None,
+    dflash_config=None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -538,6 +552,7 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
             gpu_memory_utilization=gpu_memory_utilization,
+            dflash_config=dflash_config,
         )
         logger.info(f"Model loaded (DFlash-MLX): {model_name}")
     else:
@@ -799,6 +814,31 @@ Examples:
         "(requires dflash-mlx package). E.g. /path/to/Qwen3.6-27B-DFlash",
     )
     parser.add_argument("--num-draft-tokens", type=int, default=4, help=_ap.SUPPRESS)
+    # DFlash runtime/profile/cache/diagnostics options (used when --drafter is set)
+    _bytes = _parse_byte_size
+    parser.add_argument("--profile", choices=("balanced", "fast", "low-memory", "long-session"), default=None, help="DFlash runtime profile")
+    parser.add_argument("--list-profiles", action="store_true", help="List DFlash runtime profiles and exit")
+    parser.add_argument("--dflash-max-ctx", type=int, default=None, help="DFlash hard cap on runtime context length")
+    parser.add_argument("--target-fa-window", type=int, default=None, help="DFlash target verifier full-attention KV window")
+    parser.add_argument("--draft-sink-size", type=int, default=None, help="DFlash draft context cache sink tokens")
+    parser.add_argument("--draft-window-size", type=int, default=None, help="DFlash draft context cache rolling window tokens")
+    parser.add_argument("--verify-len-cap", type=int, default=None, help="DFlash max tokens verified per target forward; 0 uses block size")
+    parser.add_argument("--diagnostics", choices=("off", "basic", "full"), default="off", help="DFlash diagnostics mode")
+    parser.add_argument("--diagnostics-dir", type=str, default=None, help="DFlash diagnostics output directory")
+    parser.add_argument("--wired-limit", default="auto", help="MLX wired memory limit: auto, none, or size like 96GB")
+    parser.add_argument("--cache-limit", default="auto", help="MLX cache memory limit: auto, none, or size like 8GB")
+    parser.add_argument("--draft-quant", default=None, help="Optional in-memory draft quantization, e.g. w4:gs64")
+    parser.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None, help="DFlash clear MLX cache at request boundaries")
+    parser.add_argument("--memory-waterfall", action=argparse.BooleanOptionalAction, default=None, help="DFlash memory bucket snapshots in runtime events")
+    parser.add_argument("--bench-log-dir", type=str, default=None, help="DFlash JSONL runtime event directory")
+    parser.add_argument("--verify-mode", choices=("auto", "off"), default=None, help="DFlash verify path mode")
+    parser.add_argument("--max-snapshot-tokens", type=int, default=None, help="DFlash prefix-cache snapshot insert cap; 0 disables cap")
+    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DFlash prefix cache")
+    parser.add_argument("--prefix-cache-max-entries", type=int, default=None, help="DFlash prefix cache max entries")
+    parser.add_argument("--prefix-cache-max-bytes", type=_bytes, default=None, help="DFlash prefix cache byte budget, e.g. 32GB")
+    parser.add_argument("--prefix-cache-l2", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DFlash prefix cache SSD L2")
+    parser.add_argument("--prefix-cache-l2-dir", type=str, default=None, help="DFlash prefix cache L2 directory")
+    parser.add_argument("--prefix-cache-l2-max-bytes", type=_bytes, default=None, help="DFlash prefix cache L2 byte budget, e.g. 120GB")
     # TurboQuant flags — accepted but only functional via rapid-mlx serve (cli.py)
     parser.add_argument("--kv-cache-turboquant", action="store_true", help=_ap.SUPPRESS)
     parser.add_argument(
@@ -937,6 +977,15 @@ Examples:
     )
 
     args = parser.parse_args()
+    import sys as _sys
+    args._dflash_prefill_step_size_explicit = any(
+        a == "--prefill-step-size" or a.startswith("--prefill-step-size=")
+        for a in _sys.argv
+    )
+    if getattr(args, "list_profiles", False):
+        from dflash_mlx.runtime_profiles import format_profiles
+        print(format_profiles())
+        return
     uvicorn_log_level = configure_logging(args.log_level)
 
     # Set global configuration
@@ -1048,6 +1097,7 @@ Examples:
         cloud_api_base=args.cloud_api_base,
         cloud_api_key=args.cloud_api_key,
         drafter_path=args.drafter,
+        dflash_config=args,
     )
 
     # Start server

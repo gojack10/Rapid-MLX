@@ -17,6 +17,21 @@ import os
 import sys
 
 
+def _parse_byte_size(raw: str) -> int:
+    import argparse as _argparse
+    import re
+    value = str(raw).strip().lower()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?|bytes?)?", value)
+    if match is None:
+        raise _argparse.ArgumentTypeError("expected byte value like 8GB")
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    multipliers = {"":1,"b":1,"byte":1,"bytes":1,"k":1024,"kb":1024,"kib":1024,"m":1024**2,"mb":1024**2,"mib":1024**2,"g":1024**3,"gb":1024**3,"gib":1024**3,"t":1024**4,"tb":1024**4,"tib":1024**4}
+    if unit not in multipliers:
+        raise _argparse.ArgumentTypeError("unknown byte suffix")
+    return int(number * multipliers[unit])
+
+
 def _check_disk_space(model_name: str, force: bool = False) -> None:
     """Verify there's enough disk space to download the model.
 
@@ -200,6 +215,15 @@ def _ensure_model_downloaded(model_name: str) -> None:
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
+    if getattr(args, "list_profiles", False):
+        from dflash_mlx.runtime_profiles import format_profiles
+        print(format_profiles())
+        return
+    import sys as _sys
+    args._dflash_prefill_step_size_explicit = any(
+        a == "--prefill-step-size" or a.startswith("--prefill-step-size=")
+        for a in _sys.argv
+    )
     import logging
     import os
     import sys
@@ -212,6 +236,7 @@ def serve_command(args):
     from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
+
     uvicorn_log_level = server.configure_logging(args.log_level)
 
     # Validate tool calling arguments
@@ -533,6 +558,7 @@ def serve_command(args):
             served_model_name=args.served_model_name,
             mtp=args.enable_mtp,
             drafter_path=args.drafter,
+            dflash_config=args,
         )
     except Exception as e:
         # Show clean error instead of raw traceback. Catch the typed
@@ -2225,6 +2251,31 @@ Examples:
         help="Path to DFlash drafter checkpoint for speculative decoding "
         "(requires dflash-mlx package). E.g. /path/to/Qwen3.6-27B-DFlash",
     )
+    # DFlash runtime/profile/cache/diagnostics options (used when --drafter is set)
+    _bytes = _parse_byte_size
+    serve_parser.add_argument("--profile", choices=("balanced", "fast", "low-memory", "long-session"), default=None, help="DFlash runtime profile")
+    serve_parser.add_argument("--list-profiles", action="store_true", help="List DFlash runtime profiles and exit")
+    serve_parser.add_argument("--dflash-max-ctx", type=int, default=None, help="DFlash hard cap on runtime context length")
+    serve_parser.add_argument("--target-fa-window", type=int, default=None, help="DFlash target verifier full-attention KV window")
+    serve_parser.add_argument("--draft-sink-size", type=int, default=None, help="DFlash draft context cache sink tokens")
+    serve_parser.add_argument("--draft-window-size", type=int, default=None, help="DFlash draft context cache rolling window tokens")
+    serve_parser.add_argument("--verify-len-cap", type=int, default=None, help="DFlash max tokens verified per target forward; 0 uses block size")
+    serve_parser.add_argument("--diagnostics", choices=("off", "basic", "full"), default="off", help="DFlash diagnostics mode")
+    serve_parser.add_argument("--diagnostics-dir", type=str, default=None, help="DFlash diagnostics output directory")
+    serve_parser.add_argument("--wired-limit", default="auto", help="MLX wired memory limit: auto, none, or size like 96GB")
+    serve_parser.add_argument("--cache-limit", default="auto", help="MLX cache memory limit: auto, none, or size like 8GB")
+    serve_parser.add_argument("--draft-quant", default=None, help="Optional in-memory draft quantization, e.g. w4:gs64")
+    serve_parser.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None, help="DFlash clear MLX cache at request boundaries")
+    serve_parser.add_argument("--memory-waterfall", action=argparse.BooleanOptionalAction, default=None, help="DFlash memory bucket snapshots in runtime events")
+    serve_parser.add_argument("--bench-log-dir", type=str, default=None, help="DFlash JSONL runtime event directory")
+    serve_parser.add_argument("--verify-mode", choices=("auto", "off"), default=None, help="DFlash verify path mode")
+    serve_parser.add_argument("--max-snapshot-tokens", type=int, default=None, help="DFlash prefix-cache snapshot insert cap; 0 disables cap")
+    serve_parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DFlash prefix cache")
+    serve_parser.add_argument("--prefix-cache-max-entries", type=int, default=None, help="DFlash prefix cache max entries")
+    serve_parser.add_argument("--prefix-cache-max-bytes", type=_bytes, default=None, help="DFlash prefix cache byte budget, e.g. 32GB")
+    serve_parser.add_argument("--prefix-cache-l2", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DFlash prefix cache SSD L2")
+    serve_parser.add_argument("--prefix-cache-l2-dir", type=str, default=None, help="DFlash prefix cache L2 directory")
+    serve_parser.add_argument("--prefix-cache-l2-max-bytes", type=_bytes, default=None, help="DFlash prefix cache L2 byte budget, e.g. 120GB")
     # MTP (Multi-Token Prediction)
     serve_parser.add_argument(
         "--enable-mtp",

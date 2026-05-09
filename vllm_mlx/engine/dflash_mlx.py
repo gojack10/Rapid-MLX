@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from .batched import BatchedEngine, GenerationOutput
@@ -27,8 +28,10 @@ class DFlashMlxEngine(BatchedEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        dflash_config: Any | None = None,
     ):
         self._drafter_path = drafter_path
+        self._dflash_config = dflash_config
         self._dflash_ready = False
         self._cache_hits: int = 0
         self._cache_misses: int = 0
@@ -74,17 +77,65 @@ class DFlashMlxEngine(BatchedEngine):
         from dflash_mlx.runtime_context import (
             build_runtime_context, runtime_config_from_profile, with_metal_limits,
         )
+        from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+        from dflash_mlx.metal_limits import apply_metal_limits, parse_memory_limit
 
         logger.info("[DFlash-MLX] Loading target=%s  drafter=%s", self._model_name, self._drafter_path)
 
-        runtime_config = runtime_config_from_profile("balanced")
-        self._runtime_context = build_runtime_context(runtime_config, diagnostics_config=None)
-        self._runtime_context = with_metal_limits(self._runtime_context, None)
+        cfg = self._dflash_config
+        profile = getattr(cfg, "profile", None) or "balanced"
+        prefill_step_size = (
+            getattr(cfg, "prefill_step_size", None)
+            if getattr(cfg, "_dflash_prefill_step_size_explicit", False)
+            else None
+        )
+        runtime_config = runtime_config_from_profile(
+            profile=profile,
+            prefill_step_size=prefill_step_size,
+            draft_sink_size=getattr(cfg, "draft_sink_size", None),
+            draft_window_size=getattr(cfg, "draft_window_size", None),
+            verify_len_cap=getattr(cfg, "verify_len_cap", None),
+            prefix_cache=getattr(cfg, "prefix_cache", None),
+            prefix_cache_max_entries=getattr(cfg, "prefix_cache_max_entries", None),
+            prefix_cache_max_bytes=getattr(cfg, "prefix_cache_max_bytes", None),
+            clear_cache_boundaries=getattr(cfg, "clear_cache_boundaries", None),
+            max_snapshot_tokens=getattr(cfg, "max_snapshot_tokens", None),
+            prefix_cache_l2=getattr(cfg, "prefix_cache_l2", None),
+            prefix_cache_l2_dir=getattr(cfg, "prefix_cache_l2_dir", ""),
+            prefix_cache_l2_max_bytes=getattr(cfg, "prefix_cache_l2_max_bytes", None),
+            target_fa_window=getattr(cfg, "target_fa_window", 0) or 0,
+            dflash_max_ctx=getattr(cfg, "dflash_max_ctx", 0) or 0,
+            memory_waterfall=bool(getattr(cfg, "memory_waterfall", False)),
+            bench_log_dir=getattr(cfg, "bench_log_dir", "") or "",
+            verify_mode=getattr(cfg, "verify_mode", None),
+        )
+
+        diagnostics_mode = getattr(cfg, "diagnostics", "off") or "off"
+        diagnostics_dir = getattr(cfg, "diagnostics_dir", None)
+        bench_log_dir = getattr(cfg, "bench_log_dir", None)
+        trace_dir = Path(diagnostics_dir) if diagnostics_dir else (Path(bench_log_dir) if bench_log_dir else None)
+        if trace_dir is not None:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_config = DiagnosticsConfig(
+            mode=diagnostics_mode,
+            run_dir=Path(diagnostics_dir) if diagnostics_dir else None,
+            memory_waterfall=bool(getattr(cfg, "memory_waterfall", False) or diagnostics_mode == "full"),
+            trace=TraceConfig(log_dir=trace_dir, cycle_events=diagnostics_mode == "full"),
+        )
+
+        self._runtime_context = build_runtime_context(runtime_config, diagnostics_config=diagnostics_config)
+        wired_limit = getattr(cfg, "wired_limit", "auto") or "auto"
+        cache_limit = getattr(cfg, "cache_limit", "auto") or "auto"
+        metal_limits = apply_metal_limits(
+            wired_request=parse_memory_limit(wired_limit) if isinstance(wired_limit, str) else wired_limit,
+            cache_request=parse_memory_limit(cache_limit) if isinstance(cache_limit, str) else cache_limit,
+        )
+        self._runtime_context = with_metal_limits(self._runtime_context, metal_limits)
 
         target_model, tokenizer, draft_model, _resolved = load_runtime_components(
             model_ref=self._model_name,
             draft_ref=self._drafter_path,
-            draft_quant=None,
+            draft_quant=getattr(cfg, "draft_quant", None),
             verify_config=self._runtime_context.verify,
         )
 
@@ -98,10 +149,12 @@ class DFlashMlxEngine(BatchedEngine):
         rc = self._runtime_context.runtime
         logger.info(
             "[DFlash-MLX] Config: profile=%s verify=%s draft_sink=%s draft_window=%s "
-            "prefix_cache=%s max_snapshot=%s prefill_step=%s",
+            "prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s prefill_step=%s",
             getattr(rc, "profile", "balanced"), getattr(rc, "verify_mode", "auto"),
             getattr(rc, "draft_sink_size", 64), getattr(rc, "draft_window_size", 1024),
-            getattr(rc, "prefix_cache", False), getattr(rc, "max_snapshot_tokens", 24000),
+            getattr(rc, "prefix_cache", False),
+            getattr(rc, "prefix_cache_max_entries", 4), getattr(rc, "prefix_cache_max_bytes", 0),
+            getattr(rc, "prefix_cache_l2", False), getattr(rc, "max_snapshot_tokens", 24000),
             getattr(rc, "prefill_step_size", 4096),
         )
         gc.collect()
