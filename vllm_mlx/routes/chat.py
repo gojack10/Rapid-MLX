@@ -50,6 +50,7 @@ from ..service.helpers import (
     _resolve_max_tokens,
     _resolve_model_name,
     _resolve_temperature,
+    _resolve_top_k,
     _resolve_top_p,
     _validate_model_name,
     _validate_tool_call_params,
@@ -427,6 +428,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "max_tokens": _resolve_max_tokens(request.max_tokens, request.enable_thinking),
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
+        "top_k": _resolve_top_k(request.top_k),
         "stop": request.stop,
     }
 

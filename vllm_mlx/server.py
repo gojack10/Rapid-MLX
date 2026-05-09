@@ -173,7 +173,7 @@ _thinking_token_budget: int = 2048  # Extra tokens added for thinking models
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
-
+_default_top_k: int | None = None  # Set via --default-top-k
 
 # Global MCP manager
 _mcp_manager = None
@@ -628,6 +628,7 @@ def _sync_config() -> None:
     cfg.default_timeout = _default_timeout
     cfg.default_temperature = _default_temperature
     cfg.default_top_p = _default_top_p
+    cfg.default_top_k = _default_top_k
     cfg.enable_auto_tool_choice = _enable_auto_tool_choice
     cfg.tool_call_parser = _tool_call_parser
     cfg.tool_parser_instance = _tool_parser_instance
@@ -870,6 +871,13 @@ Examples:
         help="Default top_p for generation when not specified in request",
     )
     parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for generation when not specified in request. "
+        "Recommended: 20 for Qwen3.x models (helps prevent repetition loops)",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=2048,
@@ -907,13 +915,15 @@ Examples:
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
-    global _default_temperature, _default_top_p
+    global _default_temperature, _default_top_p, _default_top_k
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
 
     # Configure rate limiter
     if args.rate_limit > 0:

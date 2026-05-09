@@ -625,10 +625,12 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
+        top_k = kwargs.pop("top_k", None)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k if top_k is not None else 0,
             stop=stop or [],
         )
 
@@ -704,10 +706,12 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only
         from ..request import SamplingParams
 
+        top_k = kwargs.pop("top_k", None)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k if top_k is not None else 0,
             stop=stop or [],
         )
 

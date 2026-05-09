@@ -386,7 +386,8 @@ class MLXModelRunner:
             # Create sampler from sampling params
             temp = getattr(sampling_params, "temperature", 0.7)
             top_p = getattr(sampling_params, "top_p", 0.9)
-            sampler = make_sampler(temp=temp, top_p=top_p)
+            top_k = getattr(sampling_params, "top_k", 0)
+            sampler = make_sampler(temp=temp, top_p=top_p, top_k=top_k)
 
             # Convert token IDs to MLX array
             prompt = mx.array(prompt_token_ids)

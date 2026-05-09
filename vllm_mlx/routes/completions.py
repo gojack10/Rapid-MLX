@@ -23,6 +23,7 @@ from ..service.helpers import (
     _resolve_max_tokens,
     _resolve_model_name,
     _resolve_temperature,
+    _resolve_top_k,
     _resolve_top_p,
     _validate_model_name,
     _wait_with_disconnect,
@@ -79,6 +80,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 max_tokens=_resolve_max_tokens(request.max_tokens),
                 temperature=_resolve_temperature(request.temperature),
                 top_p=_resolve_top_p(request.top_p),
+                top_k=_resolve_top_k(request.top_k),
                 stop=request.stop,
             ),
             raw_request,
@@ -131,6 +133,7 @@ async def stream_completion(
         max_tokens=_resolve_max_tokens(request.max_tokens),
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
+        top_k=_resolve_top_k(request.top_k),
         stop=request.stop,
     ):
         data = {

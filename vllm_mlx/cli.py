@@ -308,6 +308,8 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        server._default_top_k = args.default_top_k
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -2430,6 +2432,13 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests. "
+        "Recommended: 20 for Qwen3.x models (helps prevent repetition loops)",
     )
     # Cloud routing options
     serve_parser.add_argument(

@@ -92,6 +92,16 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_top_k(request_value: int | None) -> int:
+    """Resolve top_k: request > CLI default > fallback (0 = disabled)."""
+    if request_value is not None:
+        return request_value
+    cfg = get_config()
+    if cfg.default_top_k is not None:
+        return cfg.default_top_k
+    return 0
+
+
 # ── Usage / logprobs ───────────────────────────────────────────────
 
 

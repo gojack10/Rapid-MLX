@@ -1756,6 +1756,7 @@ class Scheduler:
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
+            top_k=sampling_params.top_k,
         )
 
         stop_tokens = self._get_stop_tokens()
@@ -2550,6 +2551,7 @@ class Scheduler:
                 temp=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
                 min_p=request.sampling_params.min_p,
+                top_k=request.sampling_params.top_k,
             )
 
             try:
