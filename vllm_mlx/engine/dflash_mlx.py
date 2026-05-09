@@ -393,6 +393,46 @@ class DFlashMlxEngine(BatchedEngine):
 
             c_entries = len(getattr(cache, "_entries", {}))
             c_stats = getattr(cache, "_stats", {})
+            if hit_tokens == 0:
+                # Full prefix lookup missed. Scan for checkpoint snapshots —
+                # prefill snapshots captured at safe chunk boundaries that
+                # match a prefix of the current prompt. These let us restore
+                # the longest shared prefix and only prefill the divergent
+                # tail, instead of re-prefilling everything from scratch.
+                best_checkpoint_len = 0
+                best_checkpoint_snap = None
+                best_checkpoint_id = -1
+                for eid, snap in cache._entries.items():
+                    if snap.key != key:
+                        continue
+                    if snap.kind != "prefill":
+                        continue
+                    snap_len = len(snap.token_ids)
+                    if snap_len == 0 or snap_len > len(lookup_tokens):
+                        continue
+                    if tuple(lookup_tokens[:snap_len]) == snap.token_ids:
+                        if snap_len > best_checkpoint_len:
+                            best_checkpoint_id = eid
+                            best_checkpoint_len = snap_len
+                            best_checkpoint_snap = snap
+                if best_checkpoint_len > 0:
+                    snapshot = best_checkpoint_snap
+                    hit_tokens = best_checkpoint_len
+                    # Promote the checkpoint in LRU order so it survives
+                    # eviction during this request's prefill checkpoint inserts.
+                    try:
+                        if best_checkpoint_id in cache._lru_order:
+                            cache._lru_order.remove(best_checkpoint_id)
+                            cache._lru_order.append(best_checkpoint_id)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[DFlash-MLX] checkpoint HIT %d/%d tokens "
+                        "(entry=%d, entries=%d, will prefill tail %d..%d, lookup_ms=%.2fms)",
+                        best_checkpoint_len, len(prompt_ids),
+                        best_checkpoint_id, c_entries,
+                        best_checkpoint_len, len(prompt_ids), lookup_ms,
+                    )
             if hit_tokens > 0:
                 logger.info(
                     "[DFlash-MLX] prefix cache HIT %d/%d tokens "
