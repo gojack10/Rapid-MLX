@@ -20,6 +20,7 @@ from ..api.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChoiceLogProbs,
+    PromptTokensDetails,
     TokenLogProb,
     Usage,
 )
@@ -797,6 +798,7 @@ async def stream_chat_completion(
         # Track token counts for usage reporting
         prompt_tokens = 0
         completion_tokens = 0
+        cached_tokens = 0
 
         # Stream content — PostProcessor handles reasoning/tool/sanitize
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -804,6 +806,8 @@ async def stream_chat_completion(
                 prompt_tokens = output.prompt_tokens
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
+            if hasattr(output, "cached_tokens") and output.cached_tokens:
+                cached_tokens = int(output.cached_tokens)
 
             for event in processor.process_chunk(output):
                 if event.type == "content":
@@ -887,6 +891,11 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=(
+                        PromptTokensDetails(cached_tokens=cached_tokens)
+                        if cached_tokens > 0
+                        else None
+                    ),
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"

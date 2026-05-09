@@ -21,6 +21,7 @@ class GenerationOutput:
     tokens: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int = 0
     finish_reason: str | None = "stop"
     # For streaming
     new_text: str = ""

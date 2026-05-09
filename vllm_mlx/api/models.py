@@ -250,12 +250,20 @@ class CompletionTokensDetails(BaseModel):
     reasoning_tokens: int = 0
 
 
+class PromptTokensDetails(BaseModel):
+    """Breakdown of prompt token usage (OpenAI-compatible)."""
+
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
 class Usage(BaseModel):
     """Token usage statistics."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails | None = None
     completion_tokens_details: CompletionTokensDetails | None = None
 
 

@@ -21,6 +21,7 @@ from starlette.requests import Request
 from ..api.models import (
     CompletionTokensDetails,
     FunctionCall,
+    PromptTokensDetails,
     TokenLogProb,
     ToolCall,
     TopLogProb,
@@ -106,24 +107,26 @@ def _resolve_top_k(request_value: int | None) -> int:
 
 
 def _build_usage(output: GenerationOutput, reasoning_text: str | None) -> Usage:
-    """Build Usage with reasoning token breakdown when applicable."""
+    """Build Usage with OpenAI-compatible token breakdowns."""
     cfg = get_config()
     total_completion = output.completion_tokens
+    cached_tokens = max(0, int(getattr(output, "cached_tokens", 0) or 0))
+    prompt_details = (
+        PromptTokensDetails(cached_tokens=cached_tokens)
+        if cached_tokens > 0
+        else None
+    )
+    completion_details = None
     if reasoning_text and cfg.reasoning_parser_name:
         reasoning_tokens = max(1, len(reasoning_text) // 4)
         reasoning_tokens = min(reasoning_tokens, total_completion)
-        return Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=total_completion,
-            total_tokens=output.prompt_tokens + total_completion,
-            completion_tokens_details=CompletionTokensDetails(
-                reasoning_tokens=reasoning_tokens,
-            ),
-        )
+        completion_details = CompletionTokensDetails(reasoning_tokens=reasoning_tokens)
     return Usage(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=total_completion,
         total_tokens=output.prompt_tokens + total_completion,
+        prompt_tokens_details=prompt_details,
+        completion_tokens_details=completion_details,
     )
 
 
@@ -135,10 +138,16 @@ def get_usage(output: GenerationOutput) -> Usage:
     total_completion_tokens = (
         output.completion_tokens if hasattr(output, "completion_tokens") else 0
     )
+    cached_tokens = max(0, int(getattr(output, "cached_tokens", 0) or 0))
     return Usage(
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         total_tokens=total_prompt_tokens + total_completion_tokens,
+        prompt_tokens_details=(
+            PromptTokensDetails(cached_tokens=cached_tokens)
+            if cached_tokens > 0
+            else None
+        ),
     )
 
 

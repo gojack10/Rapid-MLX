@@ -208,6 +208,7 @@ class DFlashMlxEngine(BatchedEngine):
         return GenerationOutput(
             text=output_text, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens, finish_reason=finish_reason,
+            cached_tokens=getattr(self, "_last_request_cached_tokens", 0),
         )
 
     async def stream_generate(self, prompt, max_tokens=256, temperature=0.7, top_p=0.9,
@@ -294,6 +295,7 @@ class DFlashMlxEngine(BatchedEngine):
                 yield GenerationOutput(
                     text=full_text, new_text=token_text,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
                     finished=False, finish_reason=None,
                 )
             elif ename == "summary":
@@ -331,9 +333,12 @@ class DFlashMlxEngine(BatchedEngine):
             cache_tag, prefix_flow.get("lookup_ms", 0),
         )
 
+        self._last_request_cached_tokens = int(prefix_flow.get("hit_tokens", 0) or 0)
         yield GenerationOutput(
             text=full_text, prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens, finished=True,
+            completion_tokens=completion_tokens,
+            cached_tokens=self._last_request_cached_tokens,
+            finished=True,
             finish_reason=finish_reason,
         )
 
