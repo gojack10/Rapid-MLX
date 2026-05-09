@@ -362,7 +362,9 @@ class DFlashMlxEngine(BatchedEngine):
             )
 
             lookup_tokens = prompt_ids[:stable_prefix_len]
-            # Debug: compare against existing cache entries
+            # Debug: compare against existing cache entries and remember the
+            # longest divergent match so misses tell us exactly what moved.
+            best_divergent: tuple[Any, Any, int] | None = None
             for eid, snap in sorted(getattr(cache, "_entries", {}).items(), key=lambda x: len(x[1].token_ids)):
                 st = snap.token_ids
                 common = 0
@@ -370,6 +372,9 @@ class DFlashMlxEngine(BatchedEngine):
                     if lookup_tokens[i] != st[i]:
                         break
                     common += 1
+                if common > 0 and common < min(len(lookup_tokens), len(st)):
+                    if best_divergent is None or common > best_divergent[2]:
+                        best_divergent = (eid, snap, common)
                 logger.info(
                     "[DFlash-MLX] cache entry %s: stored=%d lookup=%d "
                     "common=%d kind=%s first_4=%s",
@@ -401,6 +406,10 @@ class DFlashMlxEngine(BatchedEngine):
                     c_stats.get("misses", 0), c_stats.get("fingerprint_rejects", 0),
                     lookup_ms,
                 )
+                diagnostics_mode = getattr(getattr(self._runtime_context, "diagnostics", None), "mode", "off")
+                if diagnostics_mode != "off" and best_divergent is not None:
+                    eid, snap, common = best_divergent
+                    self._log_prefix_divergence(tokenizer, lookup_tokens, snap, common, eid)
 
             flow = PrefixCacheFlow(
                 cache=cache, key=key, stable_prefix_len=stable_prefix_len,
@@ -418,6 +427,41 @@ class DFlashMlxEngine(BatchedEngine):
                     "hit_tokens": 0, "lookup_ms": 0, "handler": None}
 
     # ------------------------------------------------------------------ helpers
+    def _decode_debug_tokens(self, tokenizer, token_ids) -> str:
+        try:
+            dec = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+            text = dec.decode(list(token_ids))
+        except Exception as exc:
+            return f"<decode failed: {exc}>"
+        text = text.replace("\n", "\\n")
+        if len(text) > 700:
+            text = text[:700] + "…"
+        return text
+
+    def _log_prefix_divergence(self, tokenizer, lookup_tokens, snap, common: int, eid: Any) -> None:
+        cached_tokens = snap.token_ids
+        start = max(0, common - 40)
+        lookup_end = min(len(lookup_tokens), common + 40)
+        cached_end = min(len(cached_tokens), common + 40)
+        lookup_next = lookup_tokens[common] if common < len(lookup_tokens) else None
+        cached_next = cached_tokens[common] if common < len(cached_tokens) else None
+        logger.info(
+            "[DFlash-MLX] prefix divergence best_entry=%s kind=%s stored=%d "
+            "lookup=%d common=%d lookup_next=%s cached_next=%s",
+            str(eid)[:8], getattr(snap, "kind", "?"), len(cached_tokens),
+            len(lookup_tokens), common, lookup_next, cached_next,
+        )
+        logger.info(
+            "[DFlash-MLX] lookup text around divergence [%d:%d]: %s",
+            start, lookup_end,
+            self._decode_debug_tokens(tokenizer, lookup_tokens[start:lookup_end]),
+        )
+        logger.info(
+            "[DFlash-MLX] cached text around divergence [%d:%d]: %s",
+            start, cached_end,
+            self._decode_debug_tokens(tokenizer, cached_tokens[start:cached_end]),
+        )
+
     def _count_prompt_tokens(self, prompt):
         t = self._tokenizer
         if hasattr(t, "tokenizer"):
