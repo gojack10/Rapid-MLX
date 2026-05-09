@@ -142,7 +142,7 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
         re.compile(r"qwen3\.6", re.IGNORECASE),
         ModelConfig(
             tool_call_parser="qwen3_coder_xml",
-            reasoning_parser="qwen3_6",
+            reasoning_parser="qwen3",
             is_hybrid=True,
             supports_spec_decode=False,
         ),
