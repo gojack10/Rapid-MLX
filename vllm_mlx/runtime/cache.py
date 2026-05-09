@@ -46,10 +46,27 @@ def save_prefix_cache_to_disk() -> None:
 
 
 def get_cache_dir() -> str:
-    """Get cache persistence directory based on actual model path."""
+    """Get cache persistence directory based on actual model path.
+
+    The model name comes from CLI / config and is interpolated into a
+    filesystem path, so it must not contain path-traversal sequences.
+    HF repo names don't permit ``..`` today, but ``--model`` and
+    ``--served-model-name`` are arbitrary user input — sanitize
+    defensively (issue #194).
+    """
     cfg = get_config()
     model_name = cfg.model_path or cfg.model_name or "default"
-    safe_name = str(model_name).replace("/", "--").replace("\\", "--")
+    # Replace separators and traversal sequences, then strip leading
+    # dots so a name like ``../../etc`` collapses to ``----etc`` instead
+    # of escaping the prefix-cache root. Empty result → fall back to a
+    # safe placeholder so we never join an empty path component.
+    safe_name = (
+        str(model_name)
+        .replace("/", "--")
+        .replace("\\", "--")
+        .replace("..", "--")
+        .lstrip(".")
+    ) or "default"
     return os.path.join(
         os.path.expanduser("~"), ".cache", "vllm-mlx", "prefix_cache", safe_name
     )
