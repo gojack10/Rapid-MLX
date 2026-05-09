@@ -396,12 +396,13 @@ class DFlashMlxEngine(BatchedEngine):
             if hit_tokens == 0:
                 # Full prefix lookup missed. Scan for checkpoint snapshots —
                 # prefill snapshots captured at safe chunk boundaries that
-                # match a prefix of the current prompt. These let us restore
-                # the longest shared prefix and only prefill the divergent
-                # tail, instead of re-prefilling everything from scratch.
+                # match a prefix of the current prompt. Checkpoints are stored
+                # L2-only (SSD) to save GPU memory, so we search L2 directly.
                 best_checkpoint_len = 0
                 best_checkpoint_snap = None
                 best_checkpoint_id = -1
+                # First check L1 entries (hot cache, may still have checkpoints
+                # from before the L2-only change or as fallback when L2 is absent).
                 for eid, snap in cache._entries.items():
                     if snap.key != key:
                         continue
@@ -415,22 +416,32 @@ class DFlashMlxEngine(BatchedEngine):
                             best_checkpoint_id = eid
                             best_checkpoint_len = snap_len
                             best_checkpoint_snap = snap
+                # If no checkpoint in L1, try L2 (primary store for checkpoints).
+                if best_checkpoint_snap is None and hasattr(cache, '_l2') and cache._l2 is not None:
+                    l2_snap = cache._l2.lookup(lookup_tokens, key)
+                    if l2_snap is not None:
+                        l2_len = len(l2_snap.token_ids)
+                        if l2_len > best_checkpoint_len:
+                            best_checkpoint_len = l2_len
+                            best_checkpoint_snap = l2_snap
                 if best_checkpoint_len > 0:
                     snapshot = best_checkpoint_snap
                     hit_tokens = best_checkpoint_len
                     # Promote the checkpoint in LRU order so it survives
                     # eviction during this request's prefill checkpoint inserts.
-                    try:
-                        if best_checkpoint_id in cache._lru_order:
-                            cache._lru_order.remove(best_checkpoint_id)
-                            cache._lru_order.append(best_checkpoint_id)
-                    except Exception:
-                        pass
+                    if best_checkpoint_id >= 0:
+                        try:
+                            if best_checkpoint_id in cache._lru_order:
+                                cache._lru_order.remove(best_checkpoint_id)
+                                cache._lru_order.append(best_checkpoint_id)
+                        except Exception:
+                            pass
+                    source = "L1" if best_checkpoint_id >= 0 else "L2"
                     logger.info(
                         "[DFlash-MLX] checkpoint HIT %d/%d tokens "
-                        "(entry=%d, entries=%d, will prefill tail %d..%d, lookup_ms=%.2fms)",
+                        "(source=%s, entries=%d, will prefill tail %d..%d, lookup_ms=%.2fms)",
                         best_checkpoint_len, len(prompt_ids),
-                        best_checkpoint_id, c_entries,
+                        source, c_entries,
                         best_checkpoint_len, len(prompt_ids), lookup_ms,
                     )
             if hit_tokens > 0:
