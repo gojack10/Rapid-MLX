@@ -260,11 +260,14 @@ class TestCapabilityGates:
             "mlx-community/Qwen3.6-27B-4bit",
             "unsloth/Qwen3.6-27B-MLX-8bit",
             "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "/Users/jack/.cache/rapid-mlx/models/Qwen3.6-27B-UD-MLX-6bit",
         ],
     )
     def test_qwen36_hybrid(self, model_path):
         cfg = detect_model_config(model_path)
         assert cfg is not None
+        assert cfg.tool_call_parser == "qwen3_coder_xml"
+        assert cfg.reasoning_parser == "qwen3"
         assert cfg.is_hybrid is True
         assert cfg.supports_spec_decode is False
 

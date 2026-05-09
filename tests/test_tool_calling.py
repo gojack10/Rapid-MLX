@@ -210,6 +210,21 @@ class TestParseToolCalls:
         assert tool_calls[0].function.name == "get_weather"
         assert "city" in tool_calls[0].function.arguments
 
+    def test_tool_frame_text_format_fallback(self):
+        """Test [Calling tool=name][input_start]<parameters>{json} fallback."""
+        text = (
+            "prefix [Calling tool=write][input_start]<parameters>{"
+            '"path":"style.css","content":"body { color: red; }"}'
+            " suffix"
+        )
+        cleaned, tool_calls = parse_tool_calls(text)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "write"
+        assert "style.css" in tool_calls[0].function.arguments
+        assert cleaned == "prefix  suffix"
+
     def test_multiple_tool_calls(self):
         """Test multiple tool calls in same text."""
         text = '<tool_call>{"name": "func1", "arguments": {"a": 1}}</tool_call><tool_call>{"name": "func2", "arguments": {"b": 2}}</tool_call>'

@@ -19,6 +19,7 @@ from typing import Any
 
 from jsonschema import ValidationError, validate
 
+from ..tool_parsers.abstract_tool_parser import ToolParser
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -304,6 +305,23 @@ def parse_tool_calls(
 
     # Note: We keep  tags for reasoning models
     # The user may want to see the model's reasoning process
+
+    # Fallback: text-format tool calls emitted as assistant prose.
+    if not tool_calls and ToolParser.has_text_format_tool_call(cleaned_text):
+        text_format_calls = ToolParser.extract_text_format_tool_calls(cleaned_text)
+        if text_format_calls:
+            for call_data in text_format_calls:
+                tool_calls.append(
+                    ToolCall(
+                        id=call_data.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        type="function",
+                        function=FunctionCall(
+                            name=call_data["name"],
+                            arguments=call_data["arguments"],
+                        ),
+                    )
+                )
+            cleaned_text = ToolParser.strip_text_format_tool_calls(cleaned_text)
 
     # Fallback: Raw JSON tool calls (lowest priority)
     # Only try if no other formats matched

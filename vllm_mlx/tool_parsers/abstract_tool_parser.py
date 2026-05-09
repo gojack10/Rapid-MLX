@@ -33,7 +33,12 @@ TEXT_TOOL_CALL_KV_PATTERN = re.compile(
 TEXT_TOOL_CALL_KV_PARAM = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 # Variant 2: [Calling tool: name(json_args)]  or  [Calling tool: name({...})]
 TEXT_TOOL_CALL_FN_PATTERN = re.compile(r"\[Calling\s+tool:\s*(\w+)\((\{.*?\})\)\s*\]")
-# Combined check for either variant
+# Variant 3: [Calling tool=name][input_start]<parameters>{json}
+TEXT_TOOL_CALL_FRAME_PATTERN = re.compile(
+    r"\[Calling\s+tool=([A-Za-z_][\w.-]*)\]\[input_start\]\s*<parameters>\s*",
+    re.DOTALL,
+)
+# Combined check for any variant
 TEXT_TOOL_CALL_ANY = re.compile(r"\[Calling\s+tool[=:]")
 
 
@@ -193,19 +198,85 @@ class ToolParser(ABC):
     def has_text_format_tool_call(text: str) -> bool:
         """Check if text contains a text-format tool call.
 
-        Detects two common degradation patterns:
+        Detects common degradation patterns:
           [Calling tool="name" key="value" ...]
           [Calling tool: name({json})]
+          [Calling tool=name][input_start]<parameters>{json}
         """
         return TEXT_TOOL_CALL_ANY.search(text) is not None
+
+    @staticmethod
+    def _extract_balanced_json_span(text: str, start: int) -> tuple[int, int] | None:
+        """Return the ``(start, end)`` span of a balanced JSON object."""
+        depth = 0
+        in_string = False
+        escape = False
+        obj_start = None
+
+        for i in range(start, len(text)):
+            ch = text[i]
+            if obj_start is None:
+                if ch.isspace():
+                    continue
+                if ch != "{":
+                    return None
+                obj_start = i
+                depth = 1
+                continue
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    return obj_start, i + 1
+
+        return None
+
+    @staticmethod
+    def _extract_balanced_json_object(text: str, start: int) -> str | None:
+        """Extract a balanced JSON object from text[start:]."""
+        span = ToolParser._extract_balanced_json_span(text, start)
+        if span is None:
+            return None
+        return text[span[0] : span[1]]
+
+    @staticmethod
+    def strip_text_format_tool_calls(text: str) -> str:
+        """Remove recognized text-format tool calls from surrounding content."""
+        spans: list[tuple[int, int]] = []
+        for match in TEXT_TOOL_CALL_FRAME_PATTERN.finditer(text):
+            json_span = ToolParser._extract_balanced_json_span(text, match.end())
+            if json_span is not None:
+                spans.append((match.start(), json_span[1]))
+
+        cleaned = text
+        for start, end in reversed(spans):
+            cleaned = cleaned[:start] + cleaned[end:]
+
+        cleaned = TEXT_TOOL_CALL_FN_PATTERN.sub("", cleaned)
+        cleaned = TEXT_TOOL_CALL_KV_PATTERN.sub("", cleaned)
+        return cleaned.strip()
 
     @staticmethod
     def extract_text_format_tool_calls(text: str) -> list[dict[str, Any]]:
         """Extract tool calls from text-format patterns.
 
-        Handles two variants:
+        Handles three variants:
           Variant 1: [Calling tool="name" key="value" key2="value2"]
           Variant 2: [Calling tool: name({"key": "value"})]
+          Variant 3: [Calling tool=name][input_start]<parameters>{"key":"value"}
 
         Returns list of dicts with 'id', 'name', 'arguments' keys.
         """
@@ -236,6 +307,25 @@ class ToolParser(ABC):
         for match in TEXT_TOOL_CALL_FN_PATTERN.finditer(text):
             func_name = match.group(1)
             json_str = match.group(2)
+            try:
+                arguments = json.loads(json_str)
+                if isinstance(arguments, dict) and arguments:
+                    tool_calls.append(
+                        {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "name": func_name.strip(),
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    )
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Variant 3: tool frame with a JSON parameters payload.
+        for match in TEXT_TOOL_CALL_FRAME_PATTERN.finditer(text):
+            func_name = match.group(1)
+            json_str = ToolParser._extract_balanced_json_object(text, match.end())
+            if not json_str:
+                continue
             try:
                 arguments = json.loads(json_str)
                 if isinstance(arguments, dict) and arguments:

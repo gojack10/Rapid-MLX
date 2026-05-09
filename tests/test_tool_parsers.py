@@ -861,6 +861,45 @@ class TestQwen3CoderParser:
         assert result.tool_calls[0]["name"] == "read_file"
         assert result.tool_calls[1]["name"] == "list_files"
 
+    def test_qwen3_coder_xml_recovers_tool_frame_text_format(self):
+        """Qwen3.6 parser recovers when model mimics tool transcript text."""
+        from vllm_mlx.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+
+        parser = Qwen3CoderToolParser(tokenizer=None)
+        text = (
+            "I will write it. [Calling tool=write][input_start]<parameters>{"
+            '"path":"style.css","content":"body { color: blue; }"}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.content == "I will write it. "
+        assert result.tool_calls[0]["name"] == "write"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["path"] == "style.css"
+        assert args["content"] == "body { color: blue; }"
+
+    def test_qwen3_coder_xml_streaming_recovers_tool_frame_once(self):
+        """Streaming recovery emits one structured tool_call, not raw prose."""
+        from vllm_mlx.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+
+        parser = Qwen3CoderToolParser(tokenizer=None)
+        first = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text='[Calling tool=write][input_start]<parameters>{"path":"x"}',
+            delta_text='[Calling tool=write][input_start]<parameters>{"path":"x"}',
+        )
+        second = parser.extract_tool_calls_streaming(
+            previous_text='[Calling tool=write][input_start]<parameters>{"path":"x"}',
+            current_text='[Calling tool=write][input_start]<parameters>{"path":"x"} trailing',
+            delta_text=" trailing",
+        )
+
+        assert first is not None
+        assert first["tool_calls"][0]["function"]["name"] == "write"
+        assert first["tool_calls"][0]["function"]["arguments"] == '{"path": "x"}'
+        assert second is None
+
 
 class TestQwen3XmlAlias:
     """Regression: qwen3_xml must resolve to QwenToolParser, not the Coder parser.
@@ -1275,6 +1314,7 @@ class TestTextFormatToolCallFallback:
 
     Variant 1 (KV style):  [Calling tool="name" key="value" ...]
     Variant 2 (function call style):  [Calling tool: name({"key": "value"})]
+    Variant 3 (tool frame): [Calling tool=name][input_start]<parameters>{...}
     """
 
     # -- Fixtures --
@@ -1384,6 +1424,36 @@ class TestTextFormatToolCallFallback:
         self._assert_tool_call(calls[0], "exec", command="python3 --version")
 
     # =================================================================
+    # Variant 3 - Tool frame style
+    # =================================================================
+
+    def test_variant3_tool_frame_json_args(self):
+        """Test Qwen transcript-mimic frame with JSON parameters."""
+        text = '[Calling tool=write][input_start]<parameters>{"path":"/tmp/a.txt","content":"hi"}'
+        from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+        calls = ToolParser.extract_text_format_tool_calls(text)
+        assert len(calls) == 1
+        self._assert_tool_call(calls[0], "write", path="/tmp/a.txt", content="hi")
+
+    def test_variant3_tool_frame_nested_json_and_braces_in_string(self):
+        """Tool-frame JSON scanner handles nested objects and braces in strings."""
+        text = (
+            "[Calling tool=edit][input_start]<parameters>{"
+            '"path":"style.css",'
+            '"edit":{"oldText":"body { color: red; }","newText":"body { color: blue; }"}'
+            "}"
+        )
+        from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+        calls = ToolParser.extract_text_format_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "edit"
+        args = json.loads(calls[0]["arguments"])
+        assert args["edit"]["oldText"] == "body { color: red; }"
+        assert args["edit"]["newText"] == "body { color: blue; }"
+
+    # =================================================================
     # Edge cases
     # =================================================================
 
@@ -1478,6 +1548,20 @@ class TestTextFormatToolCallFallback:
 
         assert ToolParser.has_text_format_tool_call('[Calling tool="web_search" q="x"]')
         assert ToolParser.has_text_format_tool_call('[Calling tool: func({"a":1})]')
+        assert ToolParser.has_text_format_tool_call(
+            '[Calling tool=write][input_start]<parameters>{"path":"x"}'
+        )
+
+    def test_strip_text_format_tool_calls_removes_frame_payload(self):
+        """strip_text_format_tool_calls removes variant-3 JSON payload too."""
+        from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+        text = (
+            "before [Calling tool=write][input_start]<parameters>{"
+            '"path":"x","content":"body { color: red; }"}'
+            " after"
+        )
+        assert ToolParser.strip_text_format_tool_calls(text) == "before  after"
 
     def test_has_text_format_tool_call_false(self):
         """has_text_format_tool_call() returns False for non-matching text."""

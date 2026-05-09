@@ -154,6 +154,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.json_closed = False
         self.accumulated_params = {}
         self._streaming_request = None
+        self._text_format_tool_call_emitted = False
         self.prev_tool_call_arr = []
 
     def _parse_xml_function_call(
@@ -203,6 +204,15 @@ class Qwen3CoderToolParser(ToolParser):
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
         if self.tool_call_prefix not in model_output:
+            text_calls = self.extract_text_format_tool_calls(model_output)
+            if text_calls:
+                content_index = model_output.find("[Calling tool")
+                content = model_output[:content_index] if content_index >= 0 else ""
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=text_calls,
+                    content=content if content else None,
+                )
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -260,6 +270,35 @@ class Qwen3CoderToolParser(ToolParser):
 
         delta_token_ids = delta_token_ids or []
         self.accumulated_text = current_text
+
+        # Recovery path: if a quantized model mimics the client/tool transcript
+        # format instead of the Qwen3.6 XML format, suppress the prose while it
+        # streams and convert it to structured tool_calls as soon as the JSON
+        # parameters object is complete.
+        if (
+            "[Calling tool" in current_text
+            and self.tool_call_start_token not in current_text
+        ):
+            if self._text_format_tool_call_emitted:
+                return None
+            text_calls = self.extract_text_format_tool_calls(current_text)
+            if text_calls:
+                self._text_format_tool_call_emitted = True
+                return {
+                    "tool_calls": [
+                        {
+                            "index": i,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments"],
+                            },
+                        }
+                        for i, tc in enumerate(text_calls)
+                    ]
+                }
+            return None
 
         # Check if we need to advance to next tool
         if self.json_closed and not self.in_function:
