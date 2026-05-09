@@ -63,6 +63,101 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _iter_tool_call_argument_chunks(arguments: str, chunk_size: int = 8):
+    """Yield small OpenAI-compatible tool argument deltas.
+
+    Rapid-MLX's parsers generally discover a native tool call only after the
+    model has closed the tool-call envelope. Once discovered, stream the
+    ``function.arguments`` JSON string as incremental deltas instead of one
+    monolithic blob so clients that render tool input progressively behave like
+    they do with OpenAI.
+    """
+    if arguments is None:
+        return
+    for i in range(0, len(arguments), chunk_size):
+        yield arguments[i : i + chunk_size]
+
+
+def _tool_call_sse_chunks(
+    *,
+    response_id: str,
+    model: str,
+    tool_calls: list[dict],
+    finish_reason: str | None = None,
+    usage: Usage | None = None,
+):
+    """Build SSE chunks for tool calls using OpenAI streaming delta shape.
+
+    First emit id/type/name with empty arguments, then emit only argument
+    fragments. Never put the full JSON arguments string in a single delta.
+    """
+    for fallback_index, tc in enumerate(tool_calls):
+        function = tc.get("function", {}) if isinstance(tc, dict) else {}
+        raw_arguments = function.get("arguments", "")
+        if not isinstance(raw_arguments, str):
+            raw_arguments = json.dumps(raw_arguments, ensure_ascii=False)
+
+        tc_index = tc.get("index", fallback_index) if isinstance(tc, dict) else fallback_index
+        first_delta = {
+            "index": tc_index,
+            "id": tc.get("id") if isinstance(tc, dict) else None,
+            "type": tc.get("type", "function") if isinstance(tc, dict) else "function",
+            "function": {
+                "name": function.get("name"),
+                "arguments": "",
+            },
+        }
+        # Avoid serializing null fields inside the raw dict payload.
+        first_delta = {k: v for k, v in first_delta.items() if v is not None}
+        first_delta["function"] = {
+            k: v for k, v in first_delta["function"].items() if v is not None
+        }
+
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(tool_calls=[first_delta]),
+                )
+            ],
+        )
+        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+        for arg_delta in _iter_tool_call_argument_chunks(raw_arguments):
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[
+                                {
+                                    "index": tc_index,
+                                    "function": {"arguments": arg_delta},
+                                }
+                            ]
+                        ),
+                    )
+                ],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    if finish_reason:
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=usage,
+        )
+        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+
 def _finalize_content_and_reasoning(
     raw_text: str,
     cleaned_text: str,
@@ -733,22 +828,15 @@ async def stream_chat_completion(
                     yield _fast_sse_chunk(event.reasoning, "reasoning_content")
 
                 elif event.type == "tool_call":
-                    chunk = ChatCompletionChunk(
-                        id=response_id,
+                    for _tc_sse in _tool_call_sse_chunks(
+                        response_id=response_id,
                         model=_resolve_model_name(request.model),
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                delta=ChatCompletionChunkDelta(
-                                    tool_calls=event.tool_calls,
-                                ),
-                                finish_reason=event.finish_reason,
-                            )
-                        ],
+                        tool_calls=event.tool_calls,
+                        finish_reason=event.finish_reason,
                         usage=get_usage(output) if output.finished else None,
-                    )
-                    _tc_sse = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-                    logger.info(f"[SSE-TC] {_tc_sse.strip()[:300]}")
-                    yield _tc_sse
+                    ):
+                        logger.info(f"[SSE-TC] {_tc_sse.strip()[:300]}")
+                        yield _tc_sse
 
                 elif event.type == "finish":
                     chunk = ChatCompletionChunk(
@@ -771,21 +859,14 @@ async def stream_chat_completion(
         # Fallback tool call detection
         for event in processor.finalize():
             if event.type == "tool_call":
-                tool_chunk = ChatCompletionChunk(
-                    id=response_id,
+                for _fb_sse in _tool_call_sse_chunks(
+                    response_id=response_id,
                     model=_resolve_model_name(request.model),
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            delta=ChatCompletionChunkDelta(
-                                tool_calls=event.tool_calls,
-                            ),
-                            finish_reason="tool_calls",
-                        )
-                    ],
-                )
-                _fb_sse = f"data: {tool_chunk.model_dump_json(exclude_none=True)}\n\n"
-                logger.info(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
-                yield _fb_sse
+                    tool_calls=event.tool_calls,
+                    finish_reason="tool_calls",
+                ):
+                    logger.info(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
+                    yield _fb_sse
 
         # Log throughput
         elapsed = time.perf_counter() - start_time
