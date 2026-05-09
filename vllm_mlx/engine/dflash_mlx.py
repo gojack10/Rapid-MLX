@@ -309,6 +309,20 @@ class DFlashMlxEngine(BatchedEngine):
             )
 
             lookup_tokens = prompt_ids[:stable_prefix_len]
+            # Debug: compare against existing cache entries
+            for eid, snap in sorted(getattr(cache, "_entries", {}).items(), key=lambda x: len(x[1].token_ids)):
+                st = snap.token_ids
+                common = 0
+                for i in range(min(len(lookup_tokens), len(st))):
+                    if lookup_tokens[i] != st[i]:
+                        break
+                    common += 1
+                logger.info(
+                    "[DFlash-MLX] cache entry %s: stored=%d lookup=%d "
+                    "common=%d kind=%s first_4=%s",
+                    str(eid)[:8], len(st), len(lookup_tokens),
+                    common, getattr(snap, "kind", "?"), list(st[:4]),
+                )
             lookup_t0 = time.perf_counter_ns()
             matched_len, snapshot = cache.lookup(lookup_tokens, key)
             lookup_ms = (time.perf_counter_ns() - lookup_t0) / 1e6
