@@ -539,15 +539,23 @@ def tree_verify_forward(
             if use_tree_state_gdn:
                 # ── Tree-state GDN: per-node branching (large budgets) ──
                 linear_input = layer.input_layernorm(h)
+                store_state_all = tree_cache_state is None
                 r, node_conv_states, node_states = _tree_state_gdn_forward(
                     layer.linear_attn, linear_input, layer_cache,
                     parents=ct.parents, depth_groups=depth_groups,
+                    store_state_all=store_state_all,
                 )
                 if tree_cache_state is not None:
-                    tree_cache_state.setdefault("gdn_layers", {})[layer_idx] = {
-                        "conv_states": node_conv_states,
-                        "states": node_states,
-                    }
+                    if node_states is None:
+                        tree_cache_state.setdefault("gdn_recompute_layers", {})[layer_idx] = {
+                            "linear_attn": layer.linear_attn,
+                            "inputs": linear_input,
+                        }
+                    else:
+                        tree_cache_state.setdefault("gdn_layers", {})[layer_idx] = {
+                            "conv_states": node_conv_states,
+                            "states": node_states,
+                        }
             else:
                 # ── Flat DFS sequential GDN (small budgets, fast) ──
                 linear_input = layer.input_layernorm(h)
@@ -772,6 +780,8 @@ def _group_by_depth(parents: list[int], depths: list[int]) -> list[list[int]]:
 
 _TREE_GATED_DELTA_KERNEL = None
 _TREE_GATED_DELTA_KERNEL_FAILED = False
+_TREE_GATED_DELTA_NOSTATE_KERNEL = None
+_TREE_GATED_DELTA_NOSTATE_KERNEL_FAILED = False
 
 
 @lru_cache(maxsize=512)
@@ -916,6 +926,150 @@ def _get_tree_gated_delta_kernel():
     return _TREE_GATED_DELTA_KERNEL
 
 
+def _get_tree_gated_delta_nostate_kernel():
+    """Lazy-create tree GDN kernel that keeps parent states on-chip.
+
+    This variant returns only the per-node recurrent output.  It avoids the
+    large ``state_all`` tensor used solely for later cache commit; callers can
+    recompute the accepted path state after the tree walk instead.
+    """
+    global _TREE_GATED_DELTA_NOSTATE_KERNEL, _TREE_GATED_DELTA_NOSTATE_KERNEL_FAILED
+    if _TREE_GATED_DELTA_NOSTATE_KERNEL is not None:
+        return _TREE_GATED_DELTA_NOSTATE_KERNEL
+    if _TREE_GATED_DELTA_NOSTATE_KERNEL_FAILED:
+        return None
+
+    import mlx.core as mx
+
+    if not mx.metal.is_available():
+        _TREE_GATED_DELTA_NOSTATE_KERNEL_FAILED = True
+        return None
+
+    source = r"""
+        auto hv_idx = thread_position_in_grid.z;
+        auto dv_idx = thread_position_in_grid.y;
+        auto dk_lane = thread_position_in_threadgroup.x;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        float state[n_per_t];
+        float state_hist[TMAX][n_per_t];
+
+        for (int t = 0; t < T; ++t) {
+          auto parent_idx = parents[t];
+
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            if (parent_idx < 0) {
+              auto base_off = (hv_idx * Dv + dv_idx) * Dk + s_idx;
+              state[i] = static_cast<float>(base_state[base_off]);
+            } else {
+              state[i] = state_hist[parent_idx][i];
+            }
+          }
+
+          auto q_ = q + (t * Hk + hk_idx) * Dk;
+          auto k_ = k + (t * Hk + hk_idx) * Dk;
+          auto v_ = v + (t * Hv + hv_idx) * Dv;
+          auto g_ = g + t * Hv;
+          auto beta_ = beta + t * Hv;
+
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+            kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            out += state[i] * static_cast<float>(q_[s_idx]);
+          }
+          out = simd_sum(out);
+
+          if (thread_index_in_simdgroup == 0) {
+            y[(t * Hv + hv_idx) * Dv + dv_idx] = static_cast<InT>(out);
+          }
+
+          for (int i = 0; i < n_per_t; ++i) {
+            state_hist[t][i] = state[i];
+          }
+        }
+    """
+
+    try:
+        _TREE_GATED_DELTA_NOSTATE_KERNEL = mx.fast.metal_kernel(
+            name="ddtree_gated_delta_tree_nostate",
+            input_names=["q", "k", "v", "g", "beta", "base_state", "parents", "T"],
+            output_names=["y"],
+            source=source,
+        )
+    except Exception:
+        _TREE_GATED_DELTA_NOSTATE_KERNEL_FAILED = True
+        return None
+    return _TREE_GATED_DELTA_NOSTATE_KERNEL
+
+
+def _tree_gated_delta_metal_nostate(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    base_state,
+    parents_array,
+):
+    import mlx.core as mx
+
+    if (
+        mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or g.ndim != 3
+        or int(q.shape[0]) != 1
+    ):
+        return None
+
+    _, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    if Dk < 32 or Dk % 32 != 0 or Hv % Hk != 0 or T > 64:
+        return None
+
+    kernel = _get_tree_gated_delta_nostate_kernel()
+    if kernel is None:
+        return None
+
+    input_type = q.dtype
+    state_type = base_state.dtype
+    try:
+        (y,) = kernel(
+            inputs=[q, k, v, g, beta, base_state, parents_array, T],
+            template=[
+                ("InT", input_type),
+                ("StT", state_type),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+                ("TMAX", T),
+            ],
+            grid=(32, Dv, Hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[(1, T, Hv, Dv)],
+            output_dtypes=[input_type],
+        )
+    except Exception:
+        return None
+    return y
+
+
 def _tree_gated_delta_metal(
     q,
     k,
@@ -976,6 +1130,7 @@ def _tree_state_gdn_forward_fast(
     cache,
     *,
     parents: list[int],
+    store_state_all: bool = True,
 ):
     """Fast exact tree-state GDN using vectorized conv + tree Metal kernel."""
     import mlx.core as mx
@@ -1043,13 +1198,22 @@ def _tree_state_gdn_forward_fast(
     g = compute_g(linear_attn.A_log, a, linear_attn.dt_bias)
 
     parents_array = _parents_mx_cached(parents_tuple)
-    kernel_result = _tree_gated_delta_metal(q, k, v, g, beta, base_state, parents_array)
-    if kernel_result is None:
-        return None
-    raw_out, state_all = kernel_result
+    if store_state_all:
+        kernel_result = _tree_gated_delta_metal(q, k, v, g, beta, base_state, parents_array)
+        if kernel_result is None:
+            return None
+        raw_out, state_all = kernel_result
+    else:
+        raw_out = _tree_gated_delta_metal_nostate(q, k, v, g, beta, base_state, parents_array)
+        if raw_out is None:
+            return None
+        state_all = None
 
     out = linear_attn.norm(raw_out, z)
     out = linear_attn.out_proj(out.reshape(B, T, -1))
+
+    if state_all is None:
+        return out, None, None
 
     # Return compact all-node tensors.  Commit selects only the final accepted
     # node; building a Python list of T lazy mx.take ops per GDN layer per
@@ -1064,7 +1228,8 @@ def _tree_state_gdn_forward(
     *,
     parents: list[int],
     depth_groups: list[list[int]],
-) -> "tuple[mx.array, list, list]":
+    store_state_all: bool = True,
+) -> "tuple[mx.array, list | None, list | None]":
     """Run one GatedDeltaNet layer with per-node state branching.
 
     Processes nodes depth-by-depth. At each depth, gathers parent GDN
@@ -1093,6 +1258,7 @@ def _tree_state_gdn_forward(
         inputs,
         cache,
         parents=parents,
+        store_state_all=store_state_all,
     )
     if fast_result is not None:
         return fast_result
