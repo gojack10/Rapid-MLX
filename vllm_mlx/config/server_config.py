@@ -77,9 +77,10 @@ class ServerConfig:
 
     # --- Stream smoothing ---
     stream_smoothing: bool = False
-    stream_smoothing_warmup: float = 0.5  # seconds of passthrough before smoothing kicks in
-    stream_smoothing_ratio: float = 0.90  # smooth to 90% of observed throughput
-    stream_smoothing_pause: float = 0.05  # seconds to pause when buffer empties
+    stream_smoothing_warmup_secs: float = 0.6  # seconds to fill bucket before emitting
+    stream_smoothing_empty_pause: float = 0.04  # seconds to pause when buffer runs dry
+    stream_smoothing_rate_window_secs: float = 2.0  # rolling window for rate measurement
+    stream_smoothing_max_bucket_chars: int = 120  # max chars to buffer before speeding up
 
     # --- Multi-model ---
     model_registry: Any = None

@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import asyncio
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -158,15 +159,18 @@ class DFlashMlxEngine(BatchedEngine):
 
         rc = self._runtime_context.runtime
         logger.info(
-            "[DFlash-MLX] Config: profile=%s verify=%s speculative=%s draft_sink=%s draft_window=%s "
-            "prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s prefill_step=%s gen_snapshot=%s",
+            "[DFlash-MLX] Config: profile=%s verify=%s speculative=%s ddtree_budget=%s ddtree_topk=%s "
+            "draft_sink=%s draft_window=%s prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s "
+            "prefill_step=%s gen_snapshot=%s repetition_penalty=%s",
             getattr(rc, "profile", "balanced"), getattr(rc, "verify_mode", "auto"),
             getattr(rc, "speculative_mode", "dflash"),
+            getattr(rc, "ddtree_budget", None), getattr(rc, "ddtree_topk", None),
             getattr(rc, "draft_sink_size", 64), getattr(rc, "draft_window_size", 1024),
             getattr(rc, "prefix_cache", False),
             getattr(rc, "prefix_cache_max_entries", 4), getattr(rc, "prefix_cache_max_bytes", 0),
             getattr(rc, "prefix_cache_l2", False), getattr(rc, "max_snapshot_tokens", 24000),
             getattr(rc, "prefill_step_size", 4096), getattr(rc, "generation_snapshot", True),
+            getattr(rc, "repetition_penalty", 1.0),
         )
         gc.collect()
         logger.info("[DFlash-MLX] Models loaded, speculative decoding ready.")
@@ -250,8 +254,13 @@ class DFlashMlxEngine(BatchedEngine):
         request_wall_start_ns = time.perf_counter_ns()
         token_decode_ns = 0
         event_process_ns = 0
+        queue_wait_ns = 0
+        worker_started = threading.Event()
 
         def _worker() -> None:
+            nonlocal queue_wait_ns
+            queue_wait_ns = time.perf_counter_ns() - request_wall_start_ns
+            worker_started.set()
             try:
                 handler = prefix_flow.get("handler")
                 for event in stream_dflash_generate(
@@ -281,6 +290,7 @@ class DFlashMlxEngine(BatchedEngine):
 
         nonlocal_snapshot_count = [0]
         self._model_load_executor.submit(_worker)
+        worker_started.wait()  # capture queue_wait_ns before entering async loop
 
         full_text = ""
         completion_tokens = 0
@@ -302,9 +312,30 @@ class DFlashMlxEngine(BatchedEngine):
         dflash_peak_memory_gb = None
         dflash_tokens_per_cycle = 0.0
         dflash_acceptance = 0.0
+        dflash_post_prefill_wall_tps = 0.0
+        dflash_post_prefill_core_tps = 0.0
+        dflash_decode_to_last_wall_tps = 0.0
+        dflash_decode_to_last_core_tps = 0.0
+        dflash_cycle_wall_ms = 0.0
+        dflash_cycle_core_ms = 0.0
+        dflash_cycle_measured_avg_ms = 0.0
+        dflash_decode_timings_us: dict[str, Any] = {}
+        dflash_ddtree_summary: dict[str, Any] = {}
+        dflash_ddtree_timing_avg_us: dict[str, Any] = {}
+        dflash_ddtree_timing_totals_us: dict[str, Any] = {}
+        dflash_prefetch: dict[str, Any] = {}
+        prefill_event_wall_ns = 0
+        first_token_wall_ns = 0
+        last_token_wall_ns = 0
+        q_get_wait_ns = 0
+        token_yield_pause_ns = 0
+        max_queue_depth = 0
 
         while True:
+            _q_wait_start_ns = time.perf_counter_ns()
             event = await q.get()
+            q_get_wait_ns += time.perf_counter_ns() - _q_wait_start_ns
+            max_queue_depth = max(max_queue_depth, q.qsize())
             if event is None:
                 break
             if isinstance(event, dict) and "__error__" in event:
@@ -331,14 +362,23 @@ class DFlashMlxEngine(BatchedEngine):
                         "[DFlash-MLX] token %d: id=%d text=%r",
                         completion_tokens, token_id, token_text,
                     )
-                event_process_ns += time.perf_counter_ns() - event_process_start_ns
-                yield GenerationOutput(
+                now_ns = time.perf_counter_ns()
+                if first_token_wall_ns == 0:
+                    first_token_wall_ns = now_ns
+                last_token_wall_ns = now_ns
+                event_process_ns += now_ns - event_process_start_ns
+                token_output = GenerationOutput(
                     text=full_text, new_text=token_text,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                     cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
                     finished=False, finish_reason=None,
                 )
+                _yield_start_ns = time.perf_counter_ns()
+                yield token_output
+                token_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
                 continue
+            elif ename == "prefill":
+                prefill_event_wall_ns = time.perf_counter_ns()
             elif ename == "cycle_complete":
                 diagnostics_mode = getattr(
                     getattr(self._runtime_context, "diagnostics", None), "mode", "off"
@@ -372,6 +412,18 @@ class DFlashMlxEngine(BatchedEngine):
                 dflash_acceptance = float(event.get("acceptance_ratio", 0))
                 dflash_tokens_per_cycle = float(event.get("tokens_per_cycle", 0) or 0)
                 dflash_peak_memory_gb = event.get("peak_memory_gb")
+                dflash_post_prefill_wall_tps = float(event.get("post_prefill_wall_tps", 0) or 0)
+                dflash_post_prefill_core_tps = float(event.get("post_prefill_core_tps", 0) or 0)
+                dflash_decode_to_last_wall_tps = float(event.get("decode_to_last_token_wall_tps", 0) or 0)
+                dflash_decode_to_last_core_tps = float(event.get("decode_to_last_token_core_tps", 0) or 0)
+                dflash_cycle_wall_ms = float(event.get("cycle_wall_ms", 0) or 0)
+                dflash_cycle_core_ms = float(event.get("cycle_core_ms", 0) or 0)
+                dflash_cycle_measured_avg_ms = float(event.get("cycle_measured_avg_ms", 0) or 0)
+                dflash_decode_timings_us = dict(event.get("decode_timings_us", {}) or {})
+                dflash_ddtree_summary = dict(event.get("ddtree", {}) or {})
+                dflash_ddtree_timing_avg_us = dict(event.get("ddtree_timing_avg_us", {}) or {})
+                dflash_ddtree_timing_totals_us = dict(event.get("ddtree_timing_totals_us", {}) or {})
+                dflash_prefetch = dict(event.get("prefetch", {}) or {})
                 phase = event.get("phase_timings_us", {})
                 if isinstance(phase, dict):
                     dflash_prefill_us = float(phase.get("prefill", 0))
@@ -399,12 +451,25 @@ class DFlashMlxEngine(BatchedEngine):
         wall_tps = completion_tokens / (wall_us / 1_000_000) if wall_us > 0 else 0
         overhead_us = max(0.0, wall_us - dflash_elapsed_us)
         snapshot_insert_ms = float(getattr(prefix_flow.get("handler"), "insert_ms", 0.0) or 0.0)
+        first_token_ms = (
+            (first_token_wall_ns - request_wall_start_ns) / 1e6
+            if first_token_wall_ns else 0.0
+        )
+        prefill_to_first_ms = (
+            (first_token_wall_ns - prefill_event_wall_ns) / 1e6
+            if first_token_wall_ns and prefill_event_wall_ns else 0.0
+        )
+        route_to_last_wall_tps = (
+            completion_tokens / ((last_token_wall_ns - prefill_event_wall_ns) / 1e9)
+            if last_token_wall_ns and prefill_event_wall_ns and last_token_wall_ns > prefill_event_wall_ns
+            else 0.0
+        )
         logger.info(
             "[DFlash-MLX] request: %d tokens  core=%.1f tok/s wall=%.1f tok/s  "
             "accept=%.1f%%  accepted=%d/%d  cycles=%d  prefill=%.0fms  "
             "draft=%.0fms  verify=%.0fms  replay=%.0fms  commit=%.0fms  "
-            "gen_snap=%.0fms  yield_pause=%.0fms  overhead=%.0fms  decode=%.1fms  "
-            "event_proc=%.1fms  snap_async=%d insert=%.1fms  tpc=%.2f  "
+            "gen_snap=%.0fms  yield_pause=%.0fms  overhead=%.0fms  queue=%.0fms  "
+            "decode=%.1fms  event_proc=%.1fms  snap_async=%d insert=%.1fms  tpc=%.2f  "
             "peak=%.1fGB  cache=%s  lookup=%.2fms  finish=%s",
             completion_tokens, core_tps, wall_tps,
             dflash_acceptance * 100,
@@ -412,13 +477,45 @@ class DFlashMlxEngine(BatchedEngine):
             dflash_prefill_us / 1000, dflash_draft_us / 1000, dflash_verify_us / 1000,
             dflash_replay_us / 1000, dflash_commit_us / 1000,
             dflash_generation_snapshot_us / 1000, dflash_yield_pause_us / 1000,
-            overhead_us / 1000, token_decode_ns / 1e6, event_process_ns / 1e6,
+            overhead_us / 1000, queue_wait_ns / 1e6,
+            token_decode_ns / 1e6, event_process_ns / 1e6,
             nonlocal_snapshot_count[0], snapshot_insert_ms,
             dflash_tokens_per_cycle,
             float(dflash_peak_memory_gb) if dflash_peak_memory_gb is not None else 0.0,
             cache_tag, prefix_flow.get("lookup_ms", 0),
             finish_reason,
         )
+        logger.info(
+            "[DFlash-MLX] decode_observe: post_prefill wall=%.1f core=%.1f tok/s  "
+            "to_last wall=%.1f core=%.1f tok/s  route_to_last=%.1f tok/s  "
+            "cycle wall=%.2fms core=%.2fms measured=%.2fms  first=%.1fms prefill_to_first=%.1fms  "
+            "q_wait=%.1fms token_yield_pause=%.1fms max_q=%d decode_timings_us=%s prefetch=%s",
+            dflash_post_prefill_wall_tps, dflash_post_prefill_core_tps,
+            dflash_decode_to_last_wall_tps, dflash_decode_to_last_core_tps,
+            route_to_last_wall_tps,
+            dflash_cycle_wall_ms, dflash_cycle_core_ms, dflash_cycle_measured_avg_ms,
+            first_token_ms, prefill_to_first_ms,
+            q_get_wait_ns / 1e6, token_yield_pause_ns / 1e6, max_queue_depth,
+            json.dumps({k: round(float(v), 1) for k, v in dflash_decode_timings_us.items()}, separators=(",", ":")),
+            json.dumps(dflash_prefetch, separators=(",", ":"), default=str),
+        )
+        if dflash_ddtree_timing_avg_us or dflash_ddtree_summary:
+            logger.info(
+                "[DFlash-MLX] ddtree_observe: summary=%s avg_us=%s totals_ms=%s",
+                json.dumps(
+                    {k: round(float(v), 3) if isinstance(v, (int, float)) else v for k, v in dflash_ddtree_summary.items()},
+                    separators=(",", ":"),
+                    default=str,
+                ),
+                json.dumps(
+                    {k: round(float(v), 1) for k, v in dflash_ddtree_timing_avg_us.items()},
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {k: round(float(v) / 1000.0, 2) for k, v in dflash_ddtree_timing_totals_us.items()},
+                    separators=(",", ":"),
+                ),
+            )
 
         self._last_request_cached_tokens = int(prefix_flow.get("hit_tokens", 0) or 0)
         yield GenerationOutput(

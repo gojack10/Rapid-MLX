@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chat completion endpoints — /v1/chat/completions."""
 
+import asyncio
 import gc
 import json
 import logging
@@ -545,9 +546,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
             stream = SmoothingIterator(
                 stream,
-                warmup=cfg.stream_smoothing_warmup,
-                ratio=cfg.stream_smoothing_ratio,
-                empty_pause=cfg.stream_smoothing_pause,
+                warmup_secs=cfg.stream_smoothing_warmup_secs,
+                empty_pause=cfg.stream_smoothing_empty_pause,
+                rate_window_secs=cfg.stream_smoothing_rate_window_secs,
+                max_bucket_chars=cfg.stream_smoothing_max_bucket_chars,
             )
         return StreamingResponse(
             _disconnect_guard(stream, raw_request),
@@ -768,11 +770,29 @@ async def stream_chat_completion(
             escaped = json.dumps(text)
             return f'{_sse_prefix}"{field}":{escaped}{_sse_suffix}'
 
+        # Streaming pipeline observability.  `sse_yield_pause` is the time this
+        # generator is suspended after yielding chunks to FastAPI or to the
+        # smoothing wrapper, so it catches client/smoothing backpressure that is
+        # invisible to engine tok/s logs.
+        stream_output_count = 0
+        stream_postprocess_ns = 0
+        stream_sse_yield_pause_ns = 0
+        stream_sse_chunks = 0
+        stream_content_chars = 0
+        stream_reasoning_chars = 0
+        stream_tool_chunks = 0
+        stream_finish_chunks = 0
+        stream_first_payload_ns = 0
+        stream_last_payload_ns = 0
+
         # First chunk with role
         _first_sse = f'{_sse_prefix}"role":"assistant"{_sse_suffix}'
         if logger.isEnabledFor(logging.INFO):
             logger.info(f"[SSE-ROLE] {_first_sse.strip()[:200]}")
+        _yield_start_ns = time.perf_counter_ns()
+        stream_sse_chunks += 1
         yield _first_sse
+        stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
         # Initialize post-processor.
         # request_dict carries `tools` so streaming parsers (qwen3_coder etc.)
@@ -809,6 +829,7 @@ async def stream_chat_completion(
 
         # Stream content — PostProcessor handles reasoning/tool/sanitize
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            stream_output_count += 1
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
             if hasattr(output, "completion_tokens") and output.completion_tokens:
@@ -816,12 +837,23 @@ async def stream_chat_completion(
             if hasattr(output, "cached_tokens") and output.cached_tokens:
                 cached_tokens = int(output.cached_tokens)
 
-            for event in processor.process_chunk(output):
+            _post_start_ns = time.perf_counter_ns()
+            events = await asyncio.to_thread(processor.process_chunk, output)
+            stream_postprocess_ns += time.perf_counter_ns() - _post_start_ns
+            for event in events:
                 if event.type == "content":
                     if not want_logprobs:
                         _sse = _fast_sse_chunk(event.content, "content")
                         if _sse:
+                            stream_sse_chunks += 1
+                            stream_content_chars += len(event.content or "")
+                            _now_ns = time.perf_counter_ns()
+                            if stream_first_payload_ns == 0:
+                                stream_first_payload_ns = _now_ns
+                            stream_last_payload_ns = _now_ns
+                            _yield_start_ns = time.perf_counter_ns()
                             yield _sse
+                            stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
                     else:
                         chunk = ChatCompletionChunk(
                             id=response_id,
@@ -835,10 +867,28 @@ async def stream_chat_completion(
                                 )
                             ],
                         )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        _chunk_sse = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        stream_sse_chunks += 1
+                        stream_content_chars += len(event.content or "")
+                        _now_ns = time.perf_counter_ns()
+                        if stream_first_payload_ns == 0:
+                            stream_first_payload_ns = _now_ns
+                        stream_last_payload_ns = _now_ns
+                        _yield_start_ns = time.perf_counter_ns()
+                        yield _chunk_sse
+                        stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
                 elif event.type == "reasoning":
-                    yield _fast_sse_chunk(event.reasoning, "reasoning_content")
+                    _reasoning_sse = _fast_sse_chunk(event.reasoning, "reasoning_content")
+                    stream_sse_chunks += 1
+                    stream_reasoning_chars += len(event.reasoning or "")
+                    _now_ns = time.perf_counter_ns()
+                    if stream_first_payload_ns == 0:
+                        stream_first_payload_ns = _now_ns
+                    stream_last_payload_ns = _now_ns
+                    _yield_start_ns = time.perf_counter_ns()
+                    yield _reasoning_sse
+                    stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
                 elif event.type == "tool_call":
                     for _tc_sse in _tool_call_sse_chunks(
@@ -849,7 +899,15 @@ async def stream_chat_completion(
                         usage=get_usage(output) if output.finished else None,
                     ):
                         logger.info(f"[SSE-TC] {_tc_sse.strip()[:300]}")
+                        stream_sse_chunks += 1
+                        stream_tool_chunks += 1
+                        _now_ns = time.perf_counter_ns()
+                        if stream_first_payload_ns == 0:
+                            stream_first_payload_ns = _now_ns
+                        stream_last_payload_ns = _now_ns
+                        _yield_start_ns = time.perf_counter_ns()
                         yield _tc_sse
+                        stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
                 elif event.type == "finish":
                     chunk = ChatCompletionChunk(
@@ -867,7 +925,18 @@ async def stream_chat_completion(
                         ],
                         usage=get_usage(output) if output.finished else None,
                     )
-                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                    _finish_sse = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                    stream_sse_chunks += 1
+                    stream_finish_chunks += 1
+                    if event.content:
+                        stream_content_chars += len(event.content)
+                    if event.reasoning:
+                        stream_reasoning_chars += len(event.reasoning)
+                    _now_ns = time.perf_counter_ns()
+                    stream_last_payload_ns = _now_ns
+                    _yield_start_ns = time.perf_counter_ns()
+                    yield _finish_sse
+                    stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
         # Fallback tool call detection
         for event in processor.finalize():
@@ -879,13 +948,37 @@ async def stream_chat_completion(
                     finish_reason="tool_calls",
                 ):
                     logger.info(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
+                    stream_sse_chunks += 1
+                    stream_tool_chunks += 1
+                    _now_ns = time.perf_counter_ns()
+                    if stream_first_payload_ns == 0:
+                        stream_first_payload_ns = _now_ns
+                    stream_last_payload_ns = _now_ns
+                    _yield_start_ns = time.perf_counter_ns()
                     yield _fb_sse
+                    stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
 
-        # Log throughput
+        # Log throughput + streaming overhead breakdown.
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+        payload_elapsed_s = (
+            (stream_last_payload_ns - stream_first_payload_ns) / 1e9
+            if stream_last_payload_ns and stream_first_payload_ns and stream_last_payload_ns > stream_first_payload_ns
+            else 0.0
+        )
+        visible_chars = stream_content_chars + stream_reasoning_chars
+        visible_chars_per_sec = visible_chars / payload_elapsed_s if payload_elapsed_s > 0 else 0.0
         logger.info(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        )
+        logger.info(
+            "[STREAM-OBSERVE] outputs=%d sse_chunks=%d content_chars=%d reasoning_chars=%d "
+            "tool_chunks=%d finish_chunks=%d visible_cps=%.1f postprocess=%.1fms "
+            "sse_yield_pause=%.1fms smoothing=%s",
+            stream_output_count, stream_sse_chunks, stream_content_chars,
+            stream_reasoning_chars, stream_tool_chunks, stream_finish_chunks,
+            visible_chars_per_sec, stream_postprocess_ns / 1e6,
+            stream_sse_yield_pause_ns / 1e6, bool(cfg.stream_smoothing),
         )
 
         # Send final chunk with usage if requested

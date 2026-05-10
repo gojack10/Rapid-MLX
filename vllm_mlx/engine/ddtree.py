@@ -198,12 +198,20 @@ def build_ddtree_tree_from_mlx_topk(
     top_token_ids: "mx.array",
     top_log_probs: "mx.array",
     budget: int,
+    profile: dict | None = None,
 ) -> DDTree:
     """Build a DDTree from MLX top-k token IDs/log-probs.
 
     Transfers only the compact (L, K) arrays to CPU for heap construction.
+    When ``profile`` is provided, it is populated with synchronized phase
+    timings that split draft-topk materialization from Python heap work.
     """
     import mlx.core as mx
+    import time
+
+    def _profile_add(name: str, elapsed_ns: int) -> None:
+        if profile is not None:
+            profile[name] = int(profile.get(name, 0)) + int(elapsed_ns)
 
     if budget <= 0 or int(top_token_ids.shape[0]) == 0:
         return build_ddtree_tree_from_topk(
@@ -211,16 +219,29 @@ def build_ddtree_tree_from_mlx_topk(
             np.empty((0, 0), dtype=np.float32),
             budget,
         )
+    _phase_start = time.perf_counter_ns() if profile is not None else 0
     top_token_ids = top_token_ids.astype(mx.uint32)
     top_log_probs = top_log_probs.astype(mx.float32)
+    if profile is not None:
+        _profile_add("topk_cast_ns", time.perf_counter_ns() - _phase_start)
+        _phase_start = time.perf_counter_ns()
     mx.eval(top_token_ids, top_log_probs)
+    if profile is not None:
+        _profile_add("topk_sync_ns", time.perf_counter_ns() - _phase_start)
+        _phase_start = time.perf_counter_ns()
     ids_np = np.array(top_token_ids.tolist(), dtype=np.int64)
     probs_np = np.array(top_log_probs.tolist(), dtype=np.float32)
-    return build_ddtree_tree_from_topk(
+    if profile is not None:
+        _profile_add("topk_transfer_ns", time.perf_counter_ns() - _phase_start)
+        _phase_start = time.perf_counter_ns()
+    tree = build_ddtree_tree_from_topk(
         top_token_ids=ids_np,
         top_log_probs=probs_np,
         budget=budget,
     )
+    if profile is not None:
+        _profile_add("heap_build_ns", time.perf_counter_ns() - _phase_start)
+    return tree
 
 
 def build_ddtree_tree_from_mlx(

@@ -2485,8 +2485,8 @@ Examples:
         default=False,
         help=(
             "Smooth streaming output to reduce choppiness from speculative decoding. "
-            "Adapts to observed throughput and emits at 90% of average rate. "
-            "Adds ~10% to total response time for much smoother character-by-character flow."
+            "Buffers briefly, logs smoothing overhead, and emits at the observed character rate. "
+            "May change perceived speed; disable while measuring raw decode throughput."
         ),
     )
     # Pinned prefix cache (Tier 0 optimization)
