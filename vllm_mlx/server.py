@@ -826,7 +826,7 @@ Examples:
     parser.add_argument("--target-fa-window", type=int, default=None, help="DFlash target verifier full-attention KV window")
     parser.add_argument("--draft-sink-size", type=int, default=None, help="DFlash draft context cache sink tokens")
     parser.add_argument("--draft-window-size", type=int, default=None, help="DFlash draft context cache rolling window tokens")
-    parser.add_argument("--draft-block-tokens", type=int, default=None, help="DFlash speculative draft block length; default uses drafter config")
+    parser.add_argument("--draft-block-tokens", type=str, default=None, help="DFlash speculative draft block length; integer, or auto for measured per-drafter defaults")
     parser.add_argument("--verify-len-cap", type=int, default=None, help="DFlash max tokens verified per target forward; 0 uses block size")
     parser.add_argument("--diagnostics", choices=("off", "basic", "full"), default="off", help="DFlash diagnostics mode")
     parser.add_argument("--diagnostics-dir", type=str, default=None, help="DFlash diagnostics output directory")

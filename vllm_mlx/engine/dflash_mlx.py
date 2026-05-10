@@ -264,6 +264,7 @@ class DFlashMlxEngine(BatchedEngine):
             worker_started.set()
             try:
                 handler = prefix_flow.get("handler")
+                configured_block_tokens = int(getattr(self._runtime_context.runtime, "draft_block_tokens", 0) or 0)
                 for event in stream_dflash_generate(
                     target_model=self._target_model, tokenizer=self._tokenizer,
                     draft_model=self._draft_model, prompt="",
@@ -274,7 +275,7 @@ class DFlashMlxEngine(BatchedEngine):
                     stable_prefix_len=prefix_flow.get("stable_prefix_len"),
                     prefix_cache=prefix_flow.get("cache"),
                     runtime_context=self._runtime_context,
-                    block_tokens=(getattr(self._runtime_context.runtime, "draft_block_tokens", 0) or None),
+                    block_tokens=(configured_block_tokens if configured_block_tokens > 0 else None),
                 ):
                     ename = event.get("event", "")
                     if ename == "prefill_snapshot_ready" and handler:
