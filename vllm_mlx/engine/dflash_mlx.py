@@ -120,6 +120,7 @@ class DFlashMlxEngine(BatchedEngine):
             ddtree_topk=getattr(cfg, "ddtree_topk", None),
             ddtree_dense_mask=getattr(cfg, "ddtree_dense_mask", None),
             generation_snapshot=getattr(cfg, "generation_snapshot", None),
+            repetition_penalty=getattr(cfg, "repetition_penalty", None),
         )
 
         diagnostics_mode = getattr(cfg, "diagnostics", "off") or "off"
@@ -276,6 +277,8 @@ class DFlashMlxEngine(BatchedEngine):
                     prefix_cache=prefix_flow.get("cache"),
                     runtime_context=self._runtime_context,
                     block_tokens=(configured_block_tokens if configured_block_tokens > 0 else None),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
                 ):
                     ename = event.get("event", "")
                     if ename == "prefill_snapshot_ready" and handler:
