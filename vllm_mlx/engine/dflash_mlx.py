@@ -357,6 +357,15 @@ class DFlashMlxEngine(BatchedEngine):
                     completion_tokens, finish_reason,
                     event.get("generated_token_ids", [])[-10:] if event.get("generated_token_ids") else [],
                 )
+                ddtree_totals = event.get("ddtree_profile_totals_us", {})
+                if ddtree_totals:
+                    logger.info(
+                        "[DFlash-MLX] ddtree_profile_us %s",
+                        json.dumps(
+                            {k: round(float(v), 1) for k, v in ddtree_totals.items()},
+                            separators=(",", ":"),
+                        ),
+                    )
                 dflash_accepted = int(event.get("accepted_from_draft", 0))
                 dflash_cycles = int(event.get("cycles_completed", 0))
                 dflash_elapsed_us = float(event.get("elapsed_us", 0))

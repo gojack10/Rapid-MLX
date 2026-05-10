@@ -523,7 +523,7 @@ def tree_verify_forward(
 
     # For small budgets (B≤32): use flat DFS GDN (fast, rollback is cheap).
     # For large budgets (B>32): use tree-state GDN (no rollback cost).
-    use_tree_state_gdn = True  # Always: tree-state GDN avoids corrupting GDN state
+    use_tree_state_gdn = True  # Tree-state GDN avoids corrupting GDN state during commit
     depth_groups = _group_by_depth(ct.parents, ct.depths) if use_tree_state_gdn else []
 
     if not use_tree_state_gdn:
