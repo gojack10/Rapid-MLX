@@ -441,6 +441,7 @@ def tree_verify_forward(
     capture_layer_ids: set[int] | None = None,
     tree_cache_state: dict | None = None,
     compute_logits: bool = True,
+    profile: dict | None = None,
 ) -> "tuple[mx.array | None, dict]":
     """Run the target model on all tree nodes with tree attention.
 
@@ -456,6 +457,10 @@ def tree_verify_forward(
         compute_logits: When False, skip the full tree LM head and store
             normalized hidden states in tree_cache_state.  Callers can then
             compute logits only for the accepted path.
+        profile: Optional dict populated with synchronized verifier timing
+            breakdowns. Intended only for diagnostics/full because it inserts
+            synchronization points after setup, each layer, final norm, and the
+            LM head.
 
     Returns:
         (logits, captured_hidden_states):
@@ -465,6 +470,12 @@ def tree_verify_forward(
     """
     import mlx.core as mx
     import time
+
+    profile_enabled = profile is not None
+
+    def _profile_add(name: str, elapsed_ns: int) -> None:
+        if profile is not None:
+            profile[name] = int(profile.get(name, 0)) + int(elapsed_ns)
 
     # Import dflash-mlx internals for model navigation
     from dflash_mlx.engine.target_ops import resolve_target_ops
@@ -497,6 +508,11 @@ def tree_verify_forward(
     prefix_mask = mx.zeros((1, 1, ct.tree_size, actual_prefix), dtype=mx.float32)
     attention_mask_full_dfs = mx.concatenate([prefix_mask, tree_vis_dfs], axis=-1)
 
+    if profile_enabled:
+        _setup_sync_start = time.perf_counter_ns()
+        mx.eval(h, attention_mask_full_dfs)
+        _profile_add("setup_ns", time.perf_counter_ns() - _setup_sync_start)
+
     # For FA layers: reorder tokens to DFS, apply mask, reorder back
     position_ids_tree = ct.position_ids
 
@@ -517,6 +533,8 @@ def tree_verify_forward(
         tree_mask_dfs = attention_mask_full_dfs
 
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
+        _layer_profile_start = time.perf_counter_ns() if profile_enabled else 0
+        _layer_kind = "gdn" if getattr(layer, "is_linear", False) else "fa"
         if getattr(layer, "is_linear", False):
             if use_tree_state_gdn:
                 # ── Tree-state GDN: per-node branching (large budgets) ──
@@ -639,6 +657,21 @@ def tree_verify_forward(
             mlp_out = layer.mlp(mlp_input)
             h = h + mlp_out
 
+        if profile_enabled:
+            _layer_sync_start = time.perf_counter_ns()
+            mx.eval(h)
+            _layer_elapsed = time.perf_counter_ns() - _layer_profile_start
+            _layer_sync_elapsed = time.perf_counter_ns() - _layer_sync_start
+            _profile_add(f"{_layer_kind}_layers_ns", _layer_elapsed)
+            _profile_add(f"{_layer_kind}_layer_sync_ns", _layer_sync_elapsed)
+            profile.setdefault("layers", []).append(
+                {
+                    "idx": int(layer_idx),
+                    "kind": _layer_kind,
+                    "us": _layer_elapsed / 1_000.0,
+                }
+            )
+
         if capture_layer_ids and (layer_idx + 1) in capture_layer_ids:
             if use_tree_state_gdn:
                 captured[layer_idx + 1] = h  # tree-index order
@@ -646,16 +679,25 @@ def tree_verify_forward(
                 captured[layer_idx + 1] = h[:, inv_dfs, :]  # DFS→tree-index
 
     # Final norm and LM head
+    _norm_profile_start = time.perf_counter_ns() if profile_enabled else 0
     if use_tree_state_gdn:
         normalized = inner.norm(h)  # h in tree-index
     else:
         normalized = inner.norm(h)
         normalized = normalized[:, inv_dfs, :]  # DFS→tree-index
+    if profile_enabled:
+        mx.eval(normalized)
+        _profile_add("final_norm_ns", time.perf_counter_ns() - _norm_profile_start)
+
+    _lm_head_profile_start = time.perf_counter_ns() if profile_enabled else 0
     logits = (
         resolve_target_ops(target_model).logits_from_hidden(target_model, normalized)
         if compute_logits
         else None
     )
+    if profile_enabled and logits is not None:
+        mx.eval(logits)
+        _profile_add("lm_head_ns", time.perf_counter_ns() - _lm_head_profile_start)
 
     if tree_cache_state is not None:
         tree_cache_state["attention_append_order"] = "dfs"

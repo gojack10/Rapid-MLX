@@ -5,6 +5,7 @@ DFlash-MLX speculative-decoding engine adapter for Rapid-MLX.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import asyncio
@@ -338,6 +339,16 @@ class DFlashMlxEngine(BatchedEngine):
                     finished=False, finish_reason=None,
                 )
                 continue
+            elif ename == "cycle_complete":
+                diagnostics_mode = getattr(
+                    getattr(self._runtime_context, "diagnostics", None), "mode", "off"
+                )
+                if diagnostics_mode == "full":
+                    cycle_fields = {k: v for k, v in event.items() if k != "event"}
+                    logger.info(
+                        "[DFlash-MLX] cycle_profile %s",
+                        json.dumps(cycle_fields, separators=(",", ":"), default=str),
+                    )
             elif ename == "summary":
                 completion_tokens = int(event.get("generation_tokens", completion_tokens))
                 finish_reason = event.get("finish_reason", "stop")
