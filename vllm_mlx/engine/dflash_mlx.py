@@ -100,6 +100,7 @@ class DFlashMlxEngine(BatchedEngine):
             prefill_step_size=prefill_step_size,
             draft_sink_size=getattr(cfg, "draft_sink_size", None),
             draft_window_size=getattr(cfg, "draft_window_size", None),
+            draft_block_tokens=getattr(cfg, "draft_block_tokens", None),
             verify_len_cap=getattr(cfg, "verify_len_cap", None),
             prefix_cache=getattr(cfg, "prefix_cache", None),
             prefix_cache_max_entries=getattr(cfg, "prefix_cache_max_entries", None),
@@ -273,6 +274,7 @@ class DFlashMlxEngine(BatchedEngine):
                     stable_prefix_len=prefix_flow.get("stable_prefix_len"),
                     prefix_cache=prefix_flow.get("cache"),
                     runtime_context=self._runtime_context,
+                    block_tokens=(getattr(self._runtime_context.runtime, "draft_block_tokens", 0) or None),
                 ):
                     ename = event.get("event", "")
                     if ename == "prefill_snapshot_ready" and handler:
