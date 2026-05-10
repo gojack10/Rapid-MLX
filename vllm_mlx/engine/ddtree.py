@@ -609,38 +609,22 @@ def tree_verify_forward(
             if layer_cache is not None:
                 keys, values = layer_cache.update_and_fetch(keys, values)
 
-            # SDPA with tree+prefix mask
-            # For DDTree's small query counts, MLX's native SDPA with the
-            # compact full mask is faster than the Python-level split-prefix
-            # exact path even at long prefix lengths.  For exactly 16 query
-            # nodes, try the DFlash two-pass Metal SDPA kernel, which is tuned
-            # for A3B/GQA long-prefix verification.
-            output = None
-            if actual_prefix >= 8192 and int(queries.shape[2]) == 16:
-                try:
-                    from dflash_mlx.kernels import batched_sdpa_2pass_exact
-
-                    output = batched_sdpa_2pass_exact(
-                        queries=queries,
-                        keys=keys,
-                        values=values,
-                        scale=attn.scale,
-                        mask=mask_fa.astype(queries.dtype),
-                    )
-                except Exception:
-                    output = None
-            if output is None:
-                if actual_prefix >= 8192 and ct.tree_size > 512:
-                    output = _split_prefix_tree_attention(
-                        queries=queries, keys=keys, values=values,
-                        scale=attn.scale, tree_mask=tree_vis_dfs,
-                        cached_prefix_len=actual_prefix,
-                        repeat_kv=(attn.num_attention_heads != attn.num_key_value_heads),
-                    )
-                else:
-                    output = mx.fast.scaled_dot_product_attention(
-                        queries, keys, values, scale=attn.scale, mask=mask_fa.astype(queries.dtype)
-                    )
+            # SDPA with tree+prefix mask.  For DDTree's small query counts,
+            # MLX's native SDPA with the compact full mask is faster than the
+            # Python-level split-prefix exact path even at long prefix lengths.
+            # Keep the split fallback only for very large trees where a full
+            # prefix-width mask may be too expensive.
+            if actual_prefix >= 8192 and ct.tree_size > 512:
+                output = _split_prefix_tree_attention(
+                    queries=queries, keys=keys, values=values,
+                    scale=attn.scale, tree_mask=tree_vis_dfs,
+                    cached_prefix_len=actual_prefix,
+                    repeat_kv=(attn.num_attention_heads != attn.num_key_value_heads),
+                )
+            else:
+                output = mx.fast.scaled_dot_product_attention(
+                    queries, keys, values, scale=attn.scale, mask=mask_fa.astype(queries.dtype)
+                )
             output = output.transpose(0, 2, 1, 3).reshape(B_val, L_val, -1)
             r_fa = attn.o_proj(output * mx.sigmoid(gate))
 
