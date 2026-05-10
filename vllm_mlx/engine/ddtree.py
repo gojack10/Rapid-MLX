@@ -529,6 +529,19 @@ def tree_verify_forward(
     prefix_mask = mx.zeros((1, 1, ct.tree_size, actual_prefix), dtype=mx.float32)
     attention_mask_full_dfs = mx.concatenate([prefix_mask, tree_vis_dfs], axis=-1)
 
+    def _tree_mask_for_key_len(key_len: int):
+        """Build the DDTree mask for the physical KV length in this FA layer.
+
+        RotatingKVCache keeps a logical offset that can be much larger than the
+        physical KV tensor.  DDTree position ids must stay logical, but the SDPA
+        mask must match the physical keys returned by update_and_fetch().
+        """
+        physical_prefix = max(0, int(key_len) - int(ct.tree_size))
+        if physical_prefix == actual_prefix:
+            return attention_mask_full_dfs
+        prefix = mx.zeros((1, 1, ct.tree_size, physical_prefix), dtype=mx.float32)
+        return mx.concatenate([prefix, tree_vis_dfs], axis=-1)
+
     if profile_enabled:
         _setup_sync_start = time.perf_counter_ns()
         mx.eval(h, attention_mask_full_dfs)
@@ -637,6 +650,8 @@ def tree_verify_forward(
             # Update KV cache
             if layer_cache is not None:
                 keys, values = layer_cache.update_and_fetch(keys, values)
+
+            mask_fa = _tree_mask_for_key_len(int(keys.shape[2]))
 
             # SDPA with tree+prefix mask.  For DDTree's small query counts,
             # MLX's native SDPA with the compact full mask is faster than the
