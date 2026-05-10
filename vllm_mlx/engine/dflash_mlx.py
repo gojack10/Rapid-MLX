@@ -39,6 +39,7 @@ class DFlashMlxEngine(BatchedEngine):
         self._total_requests: int = 0
         self._total_tokens: int = 0
         self._total_accepted: int = 0
+        self._snapshot_executor = None
         if scheduler_config is None:
             from ..scheduler import SchedulerConfig
             scheduler_config = SchedulerConfig(
@@ -68,6 +69,9 @@ class DFlashMlxEngine(BatchedEngine):
         loop = asyncio.get_running_loop()
         self._model_load_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="dflash-load"
+        )
+        self._snapshot_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dflash-snapshot"
         )
         await loop.run_in_executor(self._model_load_executor, self._load_models_in_thread)
 
@@ -112,6 +116,7 @@ class DFlashMlxEngine(BatchedEngine):
             ddtree_budget=getattr(cfg, "ddtree_budget", None),
             ddtree_topk=getattr(cfg, "ddtree_topk", None),
             ddtree_dense_mask=getattr(cfg, "ddtree_dense_mask", None),
+            generation_snapshot=getattr(cfg, "generation_snapshot", None),
         )
 
         diagnostics_mode = getattr(cfg, "diagnostics", "off") or "off"
@@ -153,14 +158,14 @@ class DFlashMlxEngine(BatchedEngine):
         rc = self._runtime_context.runtime
         logger.info(
             "[DFlash-MLX] Config: profile=%s verify=%s speculative=%s draft_sink=%s draft_window=%s "
-            "prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s prefill_step=%s",
+            "prefix_cache=%s L1=%sx%s L2=%s max_snapshot=%s prefill_step=%s gen_snapshot=%s",
             getattr(rc, "profile", "balanced"), getattr(rc, "verify_mode", "auto"),
             getattr(rc, "speculative_mode", "dflash"),
             getattr(rc, "draft_sink_size", 64), getattr(rc, "draft_window_size", 1024),
             getattr(rc, "prefix_cache", False),
             getattr(rc, "prefix_cache_max_entries", 4), getattr(rc, "prefix_cache_max_bytes", 0),
             getattr(rc, "prefix_cache_l2", False), getattr(rc, "max_snapshot_tokens", 24000),
-            getattr(rc, "prefill_step_size", 4096),
+            getattr(rc, "prefill_step_size", 4096), getattr(rc, "generation_snapshot", True),
         )
         gc.collect()
         logger.info("[DFlash-MLX] Models loaded, speculative decoding ready.")
@@ -241,6 +246,10 @@ class DFlashMlxEngine(BatchedEngine):
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
 
+        request_wall_start_ns = time.perf_counter_ns()
+        token_decode_ns = 0
+        event_process_ns = 0
+
         def _worker() -> None:
             try:
                 handler = prefix_flow.get("handler")
@@ -258,13 +267,18 @@ class DFlashMlxEngine(BatchedEngine):
                     ename = event.get("event", "")
                     if ename == "prefill_snapshot_ready" and handler:
                         handler.handle_prefill_snapshot(event)
-                    elif ename == "generation_snapshot_ready" and handler:
-                        handler.handle_generation_snapshot(event)
+                        continue
+                    if ename == "generation_snapshot_ready" and handler:
+                        executor = self._snapshot_executor or self._model_load_executor
+                        executor.submit(handler.handle_generation_snapshot, event)
+                        nonlocal_snapshot_count[0] += 1
+                        continue
                     loop.call_soon_threadsafe(q.put_nowait, event)
                 loop.call_soon_threadsafe(q.put_nowait, None)  # sentinel
             except Exception as exc:
                 loop.call_soon_threadsafe(q.put_nowait, {"__error__": exc})
 
+        nonlocal_snapshot_count = [0]
         self._model_load_executor.submit(_worker)
 
         full_text = ""
@@ -280,6 +294,12 @@ class DFlashMlxEngine(BatchedEngine):
         dflash_prefill_us = 0
         dflash_draft_us = 0
         dflash_verify_us = 0
+        dflash_replay_us = 0
+        dflash_commit_us = 0
+        dflash_generation_snapshot_us = 0
+        dflash_yield_pause_us = 0
+        dflash_peak_memory_gb = None
+        dflash_tokens_per_cycle = 0.0
         dflash_acceptance = 0.0
 
         while True:
@@ -289,32 +309,59 @@ class DFlashMlxEngine(BatchedEngine):
             if isinstance(event, dict) and "__error__" in event:
                 raise event["__error__"]
 
+            event_process_start_ns = time.perf_counter_ns()
             ename = event.get("event", "")
             if ename == "token":
                 token_id = int(event.get("token_id", 0))
+                decode_start_ns = time.perf_counter_ns()
                 token_text = _decoder.decode([token_id])
+                token_decode_ns += time.perf_counter_ns() - decode_start_ns
                 full_text += token_text
                 completion_tokens = int(event.get("generated_tokens", completion_tokens + 1))
                 if token_id in stop_token_ids:
                     finish_reason = "stop"
+                    logger.info(
+                        "[DFlash-MLX] EOS hit: token=%d text=%r at pos %d",
+                        token_id, token_text, completion_tokens,
+                    )
+                # Log every 500th token for sampling
+                if completion_tokens % 500 == 0:
+                    logger.info(
+                        "[DFlash-MLX] token %d: id=%d text=%r",
+                        completion_tokens, token_id, token_text,
+                    )
+                event_process_ns += time.perf_counter_ns() - event_process_start_ns
                 yield GenerationOutput(
                     text=full_text, new_text=token_text,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                     cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
                     finished=False, finish_reason=None,
                 )
+                continue
             elif ename == "summary":
                 completion_tokens = int(event.get("generation_tokens", completion_tokens))
                 finish_reason = event.get("finish_reason", "stop")
+                logger.info(
+                    "[DFlash-MLX] summary: tokens=%d finish=%s generated_ids_last10=%s",
+                    completion_tokens, finish_reason,
+                    event.get("generated_token_ids", [])[-10:] if event.get("generated_token_ids") else [],
+                )
                 dflash_accepted = int(event.get("accepted_from_draft", 0))
                 dflash_cycles = int(event.get("cycles_completed", 0))
                 dflash_elapsed_us = float(event.get("elapsed_us", 0))
                 dflash_acceptance = float(event.get("acceptance_ratio", 0))
+                dflash_tokens_per_cycle = float(event.get("tokens_per_cycle", 0) or 0)
+                dflash_peak_memory_gb = event.get("peak_memory_gb")
                 phase = event.get("phase_timings_us", {})
                 if isinstance(phase, dict):
                     dflash_prefill_us = float(phase.get("prefill", 0))
                     dflash_draft_us = float(phase.get("draft", 0))
                     dflash_verify_us = float(phase.get("verify", 0))
+                    dflash_replay_us = float(phase.get("replay", 0))
+                    dflash_commit_us = float(phase.get("commit", 0))
+                    dflash_generation_snapshot_us = float(phase.get("generation_snapshot", 0))
+                    dflash_yield_pause_us = float(phase.get("yield_pause", 0))
+            event_process_ns += time.perf_counter_ns() - event_process_start_ns
 
         self._total_requests += 1
         self._total_tokens += completion_tokens
@@ -327,15 +374,30 @@ class DFlashMlxEngine(BatchedEngine):
 
         cache_tag = "HIT({}/{})".format(prefix_flow.get("hit_tokens", 0), prompt_tokens) \
             if prefix_flow.get("hit_tokens", 0) > 0 else "MISS"
-        tps = completion_tokens / (dflash_elapsed_us / 1_000_000) if dflash_elapsed_us > 0 else 0
+        wall_us = (time.perf_counter_ns() - request_wall_start_ns) / 1_000.0
+        core_tps = completion_tokens / (dflash_elapsed_us / 1_000_000) if dflash_elapsed_us > 0 else 0
+        wall_tps = completion_tokens / (wall_us / 1_000_000) if wall_us > 0 else 0
+        overhead_us = max(0.0, wall_us - dflash_elapsed_us)
+        snapshot_insert_ms = float(getattr(prefix_flow.get("handler"), "insert_ms", 0.0) or 0.0)
         logger.info(
-            "[DFlash-MLX] request: %d tokens  %.1f tok/s  accept=%.1f%%  "
-            "accepted=%d/%d  cycles=%d  prefill=%.0fms  draft=%.0fms  verify=%.0fms  "
-            "cache=%s  lookup=%.2fms",
-            completion_tokens, tps, dflash_acceptance * 100,
+            "[DFlash-MLX] request: %d tokens  core=%.1f tok/s wall=%.1f tok/s  "
+            "accept=%.1f%%  accepted=%d/%d  cycles=%d  prefill=%.0fms  "
+            "draft=%.0fms  verify=%.0fms  replay=%.0fms  commit=%.0fms  "
+            "gen_snap=%.0fms  yield_pause=%.0fms  overhead=%.0fms  decode=%.1fms  "
+            "event_proc=%.1fms  snap_async=%d insert=%.1fms  tpc=%.2f  "
+            "peak=%.1fGB  cache=%s  lookup=%.2fms  finish=%s",
+            completion_tokens, core_tps, wall_tps,
+            dflash_acceptance * 100,
             dflash_accepted, completion_tokens, dflash_cycles,
             dflash_prefill_us / 1000, dflash_draft_us / 1000, dflash_verify_us / 1000,
+            dflash_replay_us / 1000, dflash_commit_us / 1000,
+            dflash_generation_snapshot_us / 1000, dflash_yield_pause_us / 1000,
+            overhead_us / 1000, token_decode_ns / 1e6, event_process_ns / 1e6,
+            nonlocal_snapshot_count[0], snapshot_insert_ms,
+            dflash_tokens_per_cycle,
+            float(dflash_peak_memory_gb) if dflash_peak_memory_gb is not None else 0.0,
             cache_tag, prefix_flow.get("lookup_ms", 0),
+            finish_reason,
         )
 
         self._last_request_cached_tokens = int(prefix_flow.get("hit_tokens", 0) or 0)

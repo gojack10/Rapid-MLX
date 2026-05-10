@@ -11,6 +11,7 @@ per-position draft distributions under a fixed node budget.
 from __future__ import annotations
 
 import heapq
+from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
@@ -189,6 +190,35 @@ def build_ddtree_tree(
     return build_ddtree_tree_from_topk(
         top_token_ids=top_token_ids.astype(np.int64),
         top_log_probs=top_log_probs,
+        budget=budget,
+    )
+
+
+def build_ddtree_tree_from_mlx_topk(
+    top_token_ids: "mx.array",
+    top_log_probs: "mx.array",
+    budget: int,
+) -> DDTree:
+    """Build a DDTree from MLX top-k token IDs/log-probs.
+
+    Transfers only the compact (L, K) arrays to CPU for heap construction.
+    """
+    import mlx.core as mx
+
+    if budget <= 0 or int(top_token_ids.shape[0]) == 0:
+        return build_ddtree_tree_from_topk(
+            np.empty((0, 0), dtype=np.int64),
+            np.empty((0, 0), dtype=np.float32),
+            budget,
+        )
+    top_token_ids = top_token_ids.astype(mx.uint32)
+    top_log_probs = top_log_probs.astype(mx.float32)
+    mx.eval(top_token_ids, top_log_probs)
+    ids_np = np.array(top_token_ids.tolist(), dtype=np.int64)
+    probs_np = np.array(top_log_probs.tolist(), dtype=np.float32)
+    return build_ddtree_tree_from_topk(
+        top_token_ids=ids_np,
+        top_log_probs=probs_np,
         budget=budget,
     )
 
@@ -410,7 +440,8 @@ def tree_verify_forward(
     cache: list,
     capture_layer_ids: set[int] | None = None,
     tree_cache_state: dict | None = None,
-) -> "tuple[mx.array, dict]":
+    compute_logits: bool = True,
+) -> "tuple[mx.array | None, dict]":
     """Run the target model on all tree nodes with tree attention.
 
     Attention layers use tree visibility masks + per-token RoPE.
@@ -422,10 +453,14 @@ def tree_verify_forward(
         cache: List of per-layer caches.
         capture_layer_ids: Set of layer indices to capture hidden states.
         tree_cache_state: Optional dict for per-node state tracking.
+        compute_logits: When False, skip the full tree LM head and store
+            normalized hidden states in tree_cache_state.  Callers can then
+            compute logits only for the accepted path.
 
     Returns:
         (logits, captured_hidden_states):
-        - logits: (1, tree_size, vocab_size) in tree-index order.
+        - logits: (1, tree_size, vocab_size) in tree-index order, or None
+          when compute_logits=False.
         - captured_hidden_states: {layer_id: (1, tree_size, hidden_dim)}.
     """
     import mlx.core as mx
@@ -452,14 +487,17 @@ def tree_verify_forward(
     # Embed tokens in tree-index order
     h = inner.embed_tokens(ct.input_ids)  # (1, tree_size, hidden_dim)
 
-    # Build full attention mask: prefix (all attend) + tree visibility
-    tree_vis = ct.attention_mask
+    # Build full attention mask: prefix (all attend) + tree visibility.
+    # Attention KV for tree nodes is appended in DFS order, so both query rows
+    # and tree-key columns must be DFS-reordered. Reordering only rows lets a
+    # node attend to the wrong sibling/ancestor KV slot and breaks equivalence
+    # with sequential verification.
+    tree_vis = ct.attention_mask.astype(mx.float32)
+    tree_vis_dfs = tree_vis[:, :, dfs, :][:, :, :, dfs]
     prefix_mask = mx.zeros((1, 1, ct.tree_size, actual_prefix), dtype=mx.float32)
-    attention_mask_full = mx.concatenate([prefix_mask, tree_vis.astype(mx.float32)], axis=-1)
+    attention_mask_full_dfs = mx.concatenate([prefix_mask, tree_vis_dfs], axis=-1)
 
     # For FA layers: reorder tokens to DFS, apply mask, reorder back
-    dfs = ct.dfs_order
-    inv_dfs = ct.inv_dfs_order
     position_ids_tree = ct.position_ids
 
     fa_idx_list = getattr(inner, "fa_idx", None)
@@ -469,24 +507,29 @@ def tree_verify_forward(
 
     # For small budgets (B≤32): use flat DFS GDN (fast, rollback is cheap).
     # For large budgets (B>32): use tree-state GDN (no rollback cost).
-    use_tree_state_gdn = ct.tree_size > 33
+    use_tree_state_gdn = True  # Always: tree-state GDN avoids corrupting GDN state
     depth_groups = _group_by_depth(ct.parents, ct.depths) if use_tree_state_gdn else []
 
     if not use_tree_state_gdn:
         # Reorder to DFS for flat sequential GDN
         h = h[:, dfs, :]
         position_ids_dfs = ct.position_ids[dfs]
-        tree_mask_dfs = attention_mask_full[:, :, dfs, :]
+        tree_mask_dfs = attention_mask_full_dfs
 
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         if getattr(layer, "is_linear", False):
             if use_tree_state_gdn:
                 # ── Tree-state GDN: per-node branching (large budgets) ──
                 linear_input = layer.input_layernorm(h)
-                r = _tree_state_gdn_forward(
+                r, node_conv_states, node_states = _tree_state_gdn_forward(
                     layer.linear_attn, linear_input, layer_cache,
                     parents=ct.parents, depth_groups=depth_groups,
                 )
+                if tree_cache_state is not None:
+                    tree_cache_state.setdefault("gdn_layers", {})[layer_idx] = {
+                        "conv_states": node_conv_states,
+                        "states": node_states,
+                    }
             else:
                 # ── Flat DFS sequential GDN (small budgets, fast) ──
                 linear_input = layer.input_layernorm(h)
@@ -501,7 +544,7 @@ def tree_verify_forward(
                 # h is in tree-index order; reorder to DFS for attention
                 h_fa = h[:, dfs, :]
                 pos_fa = position_ids_tree[dfs]
-                mask_fa = attention_mask_full[:, :, dfs, :]
+                mask_fa = attention_mask_full_dfs
             else:
                 # h already in DFS order
                 h_fa = h
@@ -549,17 +592,37 @@ def tree_verify_forward(
                 keys, values = layer_cache.update_and_fetch(keys, values)
 
             # SDPA with tree+prefix mask
-            if actual_prefix >= 8192:
-                output = _split_prefix_tree_attention(
-                    queries=queries, keys=keys, values=values,
-                    scale=attn.scale, tree_mask=tree_vis,
-                    cached_prefix_len=actual_prefix,
-                    repeat_kv=(attn.num_attention_heads != attn.num_key_value_heads),
-                )
-            else:
-                output = mx.fast.scaled_dot_product_attention(
-                    queries, keys, values, scale=attn.scale, mask=mask_fa
-                )
+            # For DDTree's small query counts, MLX's native SDPA with the
+            # compact full mask is faster than the Python-level split-prefix
+            # exact path even at long prefix lengths.  For exactly 16 query
+            # nodes, try the DFlash two-pass Metal SDPA kernel, which is tuned
+            # for A3B/GQA long-prefix verification.
+            output = None
+            if actual_prefix >= 8192 and int(queries.shape[2]) == 16:
+                try:
+                    from dflash_mlx.kernels import batched_sdpa_2pass_exact
+
+                    output = batched_sdpa_2pass_exact(
+                        queries=queries,
+                        keys=keys,
+                        values=values,
+                        scale=attn.scale,
+                        mask=mask_fa.astype(queries.dtype),
+                    )
+                except Exception:
+                    output = None
+            if output is None:
+                if actual_prefix >= 8192 and ct.tree_size > 512:
+                    output = _split_prefix_tree_attention(
+                        queries=queries, keys=keys, values=values,
+                        scale=attn.scale, tree_mask=tree_vis_dfs,
+                        cached_prefix_len=actual_prefix,
+                        repeat_kv=(attn.num_attention_heads != attn.num_key_value_heads),
+                    )
+                else:
+                    output = mx.fast.scaled_dot_product_attention(
+                        queries, keys, values, scale=attn.scale, mask=mask_fa.astype(queries.dtype)
+                    )
             output = output.transpose(0, 2, 1, 3).reshape(B_val, L_val, -1)
             r_fa = attn.o_proj(output * mx.sigmoid(gate))
 
@@ -588,11 +651,18 @@ def tree_verify_forward(
     else:
         normalized = inner.norm(h)
         normalized = normalized[:, inv_dfs, :]  # DFS→tree-index
-    logits = resolve_target_ops(target_model).logits_from_hidden(target_model, normalized)
+    logits = (
+        resolve_target_ops(target_model).logits_from_hidden(target_model, normalized)
+        if compute_logits
+        else None
+    )
 
     if tree_cache_state is not None:
-        tree_cache_state["linear_layers"] = {}
         tree_cache_state["attention_append_order"] = "dfs"
+        tree_cache_state["dfs_order"] = ct.dfs_order
+        tree_cache_state["inv_dfs_order"] = ct.inv_dfs_order
+        if not compute_logits:
+            tree_cache_state["normalized_hidden"] = normalized
 
     return logits, captured
 
@@ -674,6 +744,293 @@ def _group_by_depth(parents: list[int], depths: list[int]) -> list[list[int]]:
     return groups
 
 
+_TREE_GATED_DELTA_KERNEL = None
+_TREE_GATED_DELTA_KERNEL_FAILED = False
+
+
+@lru_cache(maxsize=512)
+def _conv_window_indices_cached(parents_tuple: tuple[int, ...], keep: int) -> np.ndarray:
+    """Gather table for tree-branching depthwise conv windows.
+
+    Entries index a table ``[base_conv_state, qkv_tree_nodes]``.  For each
+    node, the row contains the parent's ``keep`` qkv history followed by the
+    current node qkv, matching ``conv_input = concat(parent_state, qkv_step)``.
+    """
+    parents = list(parents_tuple)
+    tree_size = len(parents)
+    window = np.empty((tree_size, keep + 1), dtype=np.int32)
+
+    for node_idx in range(tree_size):
+        # Ancestors before the current node in chronological order.
+        ancestors: list[int] = []
+        cur = int(parents[node_idx])
+        while cur >= 0:
+            ancestors.append(cur)
+            cur = int(parents[cur])
+        ancestors.reverse()
+
+        previous = ancestors[-keep:] if keep > 0 else []
+        missing = keep - len(previous)
+        row: list[int] = []
+        if missing > 0:
+            # Use the newest missing entries from the cached convolution state.
+            row.extend(range(keep - missing, keep))
+        row.extend(keep + int(idx) for idx in previous)
+        row.append(keep + int(node_idx))
+        window[node_idx, :] = row
+
+    return window
+
+
+@lru_cache(maxsize=512)
+def _conv_window_indices_mx_cached(parents_tuple: tuple[int, ...], keep: int):
+    import mlx.core as mx
+
+    return mx.array(_conv_window_indices_cached(parents_tuple, keep), dtype=mx.int32)
+
+
+@lru_cache(maxsize=512)
+def _parents_mx_cached(parents_tuple: tuple[int, ...]):
+    import mlx.core as mx
+
+    return mx.array(parents_tuple, dtype=mx.int32)
+
+
+def _get_tree_gated_delta_kernel():
+    """Lazy-create a Metal kernel for one-pass tree GatedDelta recurrence.
+
+    The native sequence kernel handles a linear chain in one launch.  The old
+    DDTree path launched a tiny GatedDelta kernel once per tree depth per layer
+    (~16 launches × 30 GDN layers on A3B).  This kernel serializes the tree
+    nodes inside each (value-head, value-dim) threadgroup and gathers parent
+    recurrent state from the already-computed parent node, reducing recurrence
+    to one launch per GDN layer.
+    """
+    global _TREE_GATED_DELTA_KERNEL, _TREE_GATED_DELTA_KERNEL_FAILED
+    if _TREE_GATED_DELTA_KERNEL is not None:
+        return _TREE_GATED_DELTA_KERNEL
+    if _TREE_GATED_DELTA_KERNEL_FAILED:
+        return None
+
+    import mlx.core as mx
+
+    if not mx.metal.is_available():
+        _TREE_GATED_DELTA_KERNEL_FAILED = True
+        return None
+
+    source = r"""
+        auto hv_idx = thread_position_in_grid.z;
+        auto dv_idx = thread_position_in_grid.y;
+        auto dk_lane = thread_position_in_threadgroup.x;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        float state[n_per_t];
+
+        for (int t = 0; t < T; ++t) {
+          auto parent_idx = parents[t];
+
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            if (parent_idx < 0) {
+              auto base_off = (hv_idx * Dv + dv_idx) * Dk + s_idx;
+              state[i] = static_cast<float>(base_state[base_off]);
+            } else {
+              auto parent_off = ((parent_idx * Hv + hv_idx) * Dv + dv_idx) * Dk + s_idx;
+              state[i] = static_cast<float>(state_all[parent_off]);
+            }
+          }
+
+          auto q_ = q + (t * Hk + hk_idx) * Dk;
+          auto k_ = k + (t * Hk + hk_idx) * Dk;
+          auto v_ = v + (t * Hv + hv_idx) * Dv;
+          auto g_ = g + t * Hv;
+          auto beta_ = beta + t * Hv;
+
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+            kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            out += state[i] * static_cast<float>(q_[s_idx]);
+          }
+          out = simd_sum(out);
+
+          if (thread_index_in_simdgroup == 0) {
+            y[(t * Hv + hv_idx) * Dv + dv_idx] = static_cast<InT>(out);
+          }
+
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_lane + i;
+            auto out_off = ((t * Hv + hv_idx) * Dv + dv_idx) * Dk + s_idx;
+            state_all[out_off] = static_cast<StT>(state[i]);
+          }
+        }
+    """
+
+    try:
+        _TREE_GATED_DELTA_KERNEL = mx.fast.metal_kernel(
+            name="ddtree_gated_delta_tree_scalar",
+            input_names=["q", "k", "v", "g", "beta", "base_state", "parents", "T"],
+            output_names=["y", "state_all"],
+            source=source,
+        )
+    except Exception:
+        _TREE_GATED_DELTA_KERNEL_FAILED = True
+        return None
+    return _TREE_GATED_DELTA_KERNEL
+
+
+def _tree_gated_delta_metal(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    base_state,
+    parents_array,
+):
+    import mlx.core as mx
+
+    if (
+        mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or g.ndim != 3
+        or int(q.shape[0]) != 1
+    ):
+        return None
+
+    _, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    if Dk < 32 or Dk % 32 != 0 or Hv % Hk != 0:
+        return None
+
+    kernel = _get_tree_gated_delta_kernel()
+    if kernel is None:
+        return None
+
+    input_type = q.dtype
+    state_type = base_state.dtype
+    try:
+        y, state_all = kernel(
+            inputs=[q, k, v, g, beta, base_state, parents_array, T],
+            template=[
+                ("InT", input_type),
+                ("StT", state_type),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid=(32, Dv, Hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[(1, T, Hv, Dv), (T, Hv, Dv, Dk)],
+            output_dtypes=[input_type, state_type],
+        )
+    except Exception:
+        return None
+    return y, state_all
+
+
+def _tree_state_gdn_forward_fast(
+    linear_attn,
+    inputs,
+    cache,
+    *,
+    parents: list[int],
+):
+    """Fast exact tree-state GDN using vectorized conv + tree Metal kernel."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.gated_delta import compute_g
+
+    B, T, _ = inputs.shape
+    if B != 1:
+        return None
+
+    keep = int(linear_attn.conv_kernel_size) - 1
+    conv_dim = linear_attn.conv_dim
+
+    if cache is not None:
+        base_conv_state = cache[0] if cache[0] is not None else mx.zeros(
+            (B, keep, conv_dim), dtype=inputs.dtype
+        )
+        base_state = cache[1] if cache[1] is not None else mx.zeros(
+            (B, linear_attn.num_v_heads, linear_attn.head_v_dim,
+             linear_attn.head_k_dim),
+            dtype=mx.float32,
+        )
+    else:
+        base_conv_state = mx.zeros((B, keep, conv_dim), dtype=inputs.dtype)
+        base_state = mx.zeros(
+            (B, linear_attn.num_v_heads, linear_attn.head_v_dim,
+             linear_attn.head_k_dim),
+            dtype=mx.float32,
+        )
+
+    # Project all nodes once.
+    qkv = linear_attn.in_proj_qkv(inputs)  # (1, T, conv_dim)
+    z = linear_attn.in_proj_z(inputs).reshape(
+        B, T, linear_attn.num_v_heads, linear_attn.head_v_dim
+    )
+    b = linear_attn.in_proj_b(inputs)
+    a = linear_attn.in_proj_a(inputs)
+
+    # Exact depthwise convolution for every tree node via precomputed ancestor
+    # windows.  This removes the old per-depth Python/kernel loop.
+    source_table = mx.concatenate([base_conv_state[0], qkv[0]], axis=0)
+    parents_tuple = tuple(int(p) for p in parents)
+    window_indices = _conv_window_indices_mx_cached(parents_tuple, keep)
+    conv_input = mx.take(source_table, window_indices, axis=0)  # (T, K, conv_dim)
+    new_conv_states_all = mx.contiguous(conv_input[:, -keep:, :]) if keep > 0 else mx.zeros(
+        (T, 0, conv_dim), dtype=inputs.dtype
+    )
+    conv_weight = linear_attn.conv1d.weight[:, :, 0].T  # (kernel, conv_dim)
+    conv_out = nn.silu((conv_input * conv_weight[None, :, :]).sum(axis=1))
+
+    q, k, v = [
+        tensor.reshape(1, T, heads, dim)
+        for tensor, heads, dim in zip(
+            mx.split(conv_out, [linear_attn.key_dim, 2 * linear_attn.key_dim], -1),
+            [linear_attn.num_k_heads, linear_attn.num_k_heads, linear_attn.num_v_heads],
+            [linear_attn.head_k_dim, linear_attn.head_k_dim, linear_attn.head_v_dim],
+            strict=True,
+        )
+    ]
+
+    inv_scale = k.shape[-1] ** -0.5
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    beta = mx.sigmoid(b)
+    g = compute_g(linear_attn.A_log, a, linear_attn.dt_bias)
+
+    parents_array = _parents_mx_cached(parents_tuple)
+    kernel_result = _tree_gated_delta_metal(q, k, v, g, beta, base_state, parents_array)
+    if kernel_result is None:
+        return None
+    raw_out, state_all = kernel_result
+
+    out = linear_attn.norm(raw_out, z)
+    out = linear_attn.out_proj(out.reshape(B, T, -1))
+
+    # Return compact all-node tensors.  Commit selects only the final accepted
+    # node; building a Python list of T lazy mx.take ops per GDN layer per
+    # cycle adds significant graph/Python overhead on A3B.
+    return out, {"all": new_conv_states_all}, {"all": state_all}
+
+
 def _tree_state_gdn_forward(
     linear_attn,
     inputs: "mx.array",
@@ -681,7 +1038,7 @@ def _tree_state_gdn_forward(
     *,
     parents: list[int],
     depth_groups: list[list[int]],
-) -> "mx.array":
+) -> "tuple[mx.array, list, list]":
     """Run one GatedDeltaNet layer with per-node state branching.
 
     Processes nodes depth-by-depth. At each depth, gathers parent GDN
@@ -691,7 +1048,11 @@ def _tree_state_gdn_forward(
     Keeps per-node GDN states in lists indexed by tree position.
     At commit time, only the final accepted node's state is kept.
 
-    Returns output hidden states in tree-index order.
+    Returns:
+        (output_hidden, node_conv_states, node_states)
+        - output_hidden: tree-index order hidden output
+        - node_conv_states: per-tree-node convolution states after that node
+        - node_states: per-tree-node recurrent states after that node
     """
     import mlx.core as mx
     import mlx.nn as nn
@@ -700,6 +1061,15 @@ def _tree_state_gdn_forward(
     B, T, _ = inputs.shape
     if B != 1:
         raise ValueError("tree-state GDN requires batch size 1")
+
+    fast_result = _tree_state_gdn_forward_fast(
+        linear_attn,
+        inputs,
+        cache,
+        parents=parents,
+    )
+    if fast_result is not None:
+        return fast_result
 
     # Project inputs
     qkv = linear_attn.in_proj_qkv(inputs)  # (1, T, conv_dim)
@@ -813,4 +1183,4 @@ def _tree_state_gdn_forward(
     out = mx.concatenate(raw_outputs, axis=1)
     out = linear_attn.norm(out, z)
     out = linear_attn.out_proj(out.reshape(B, T, -1))
-    return out
+    return out, node_conv_states, node_states
