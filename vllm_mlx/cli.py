@@ -2274,6 +2274,7 @@ Examples:
     serve_parser.add_argument("--ddtree-topk", type=int, default=None, help="DDTree top-K per position for tree construction (default 64)")
     serve_parser.add_argument("--ddtree-dense-mask", action="store_true", default=None, help="DDTree dense mask mode (temporary, for correctness)")
     serve_parser.add_argument("--generation-snapshot", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable end-of-request DFlash generation snapshots")
+    serve_parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty (>1.0 penalizes repeated tokens; default 1.0 = off)")
     serve_parser.add_argument("--max-snapshot-tokens", type=int, default=None, help="DFlash prefix-cache snapshot insert cap; 0 disables cap")
     serve_parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable DFlash prefix cache")
     serve_parser.add_argument("--prefix-cache-max-entries", type=int, default=None, help="DFlash prefix cache max entries")
