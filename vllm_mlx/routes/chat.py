@@ -539,11 +539,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         detail=f"Chat template error: {err_msg}",
                     )
                 raise
+        stream = stream_chat_completion(engine, messages, request, **chat_kwargs)
+        if cfg.stream_smoothing:
+            from ..utils.stream_smoothing import SmoothingIterator
+
+            stream = SmoothingIterator(
+                stream,
+                warmup=cfg.stream_smoothing_warmup,
+                ratio=cfg.stream_smoothing_ratio,
+                empty_pause=cfg.stream_smoothing_pause,
+            )
         return StreamingResponse(
-            _disconnect_guard(
-                stream_chat_completion(engine, messages, request, **chat_kwargs),
-                raw_request,
-            ),
+            _disconnect_guard(stream, raw_request),
             media_type="text/event-stream",
         )
 

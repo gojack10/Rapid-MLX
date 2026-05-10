@@ -316,6 +316,9 @@ def serve_command(args):
     # Configure system prompt pinning
     server._pin_system_prompt = args.pin_system_prompt
 
+    # Configure stream smoothing
+    server._stream_smoothing = args.stream_smoothing
+
     # Configure tool calling
     if args.enable_auto_tool_choice and args.tool_call_parser:
         server._enable_auto_tool_choice = True
@@ -2474,6 +2477,17 @@ Examples:
         "--no-gc-control",
         action="store_true",
         help="Disable GC control (allow normal GC during generation)",
+    )
+    # Stream smoothing (for speculative decoding)
+    serve_parser.add_argument(
+        "--stream-smoothing",
+        action="store_true",
+        default=False,
+        help=(
+            "Smooth streaming output to reduce choppiness from speculative decoding. "
+            "Adapts to observed throughput and emits at 90% of average rate. "
+            "Adds ~10% to total response time for much smoother character-by-character flow."
+        ),
     )
     # Pinned prefix cache (Tier 0 optimization)
     serve_parser.add_argument(

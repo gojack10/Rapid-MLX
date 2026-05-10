@@ -75,6 +75,12 @@ class ServerConfig:
     pin_system_prompt: bool = False
     pinned_system_prompt_hash: str | None = None
 
+    # --- Stream smoothing ---
+    stream_smoothing: bool = False
+    stream_smoothing_warmup: float = 1.5  # seconds of passthrough before smoothing kicks in
+    stream_smoothing_ratio: float = 0.90  # smooth to 90% of observed throughput
+    stream_smoothing_pause: float = 0.05  # seconds to pause when buffer empties
+
     # --- Multi-model ---
     model_registry: Any = None
 

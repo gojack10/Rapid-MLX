@@ -224,6 +224,9 @@ _no_thinking: bool = (
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
 
+# Stream smoothing (for speculative decoding)
+_stream_smoothing: bool = False  # Smooth SSE output to reduce choppiness
+
 
 from .runtime.cache import (  # noqa: E402
     get_cache_dir as _get_cache_dir,  # noqa: F401
@@ -679,6 +682,7 @@ def _sync_config() -> None:
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
+    cfg.stream_smoothing = _stream_smoothing
     cfg.mcp_executor = _mcp_executor
     cfg.model_registry = _model_registry
 
