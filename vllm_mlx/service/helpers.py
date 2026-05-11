@@ -564,8 +564,9 @@ async def _disconnect_guard(
                 )
             yield chunk
     except GeneratorExit:
-        logger.info(
-            f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
+        logger.warning(
+            f"[disconnect_guard] ** GeneratorExit (client stopped reading) "
+            f"after {chunk_count} chunks, elapsed={_elapsed()} — cancelling generator!"
         )
     finally:
         if disconnect_task and not disconnect_task.done():
@@ -574,8 +575,14 @@ async def _disconnect_guard(
             anext_task.cancel()
         try:
             await generator.aclose()
-        except Exception:
-            pass
+            logger.info(
+                f"[disconnect_guard] generator.aclose() succeeded, {chunk_count} chunks total, elapsed={_elapsed()}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[disconnect_guard] generator.aclose() raised {type(exc).__name__}: {exc}, "
+                f"{chunk_count} chunks total, elapsed={_elapsed()}"
+            )
         logger.info(
             f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
         )

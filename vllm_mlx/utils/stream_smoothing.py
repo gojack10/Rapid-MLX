@@ -99,6 +99,17 @@ class SmoothingIterator:
         return f"data: {json.dumps(out, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
     # ------------------------------------------------------------------
+    # Cleanup (propagate aclose/GeneratorExit to source)
+    # ------------------------------------------------------------------
+
+    async def aclose(self):
+        """Close the source iterator. Called on client disconnect."""
+        try:
+            await self._source.aclose()
+        except (GeneratorExit, StopAsyncIteration):
+            pass
+
+    # ------------------------------------------------------------------
     # Main iterator
     # ------------------------------------------------------------------
 
@@ -174,138 +185,146 @@ class SmoothingIterator:
 
         source_iter = self._source.__aiter__()
 
-        # --- First chunk (role) — pass through verbatim ---
         try:
-            first_raw = await source_iter.__anext__()
-        except StopAsyncIteration:
-            return
-        source_chunks += 1
-        passthrough_chunks += 1
-        yield first_raw
-
-        # --- Process remaining chunks ---
-        async for raw in source_iter:
+            # --- First chunk (role) — pass through verbatim ---
+            try:
+                first_raw = await source_iter.__anext__()
+            except StopAsyncIteration:
+                return
             source_chunks += 1
-            if done:
-                passthrough_chunks += 1
-                yield raw
-                continue
+            passthrough_chunks += 1
+            yield first_raw
 
-            if "[DONE]" in raw:
-                done = True
-                while buffer:
-                    _, _, sse = buffer.popleft()
-                    if sse:
-                        _mark_emit()
-                        yield sse
-                passthrough_chunks += 1
-                yield raw
-                continue
+            # --- Process remaining chunks ---
+            async for raw in source_iter:
+                source_chunks += 1
+                if done:
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            chunk = self._parse_sse(raw)
-            if chunk is None:
-                passthrough_chunks += 1
-                yield raw
-                continue
+                if "[DONE]" in raw:
+                    done = True
+                    while buffer:
+                        _, _, sse = buffer.popleft()
+                        if sse:
+                            _mark_emit()
+                            yield sse
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            if template is None:
-                template = dict(chunk)
+                chunk = self._parse_sse(raw)
+                if chunk is None:
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            if self._has_finish(chunk):
-                while buffer:
-                    _, _, sse = buffer.popleft()
-                    if sse:
-                        _mark_emit()
-                        yield sse
-                passthrough_chunks += 1
-                yield raw
-                continue
+                if template is None:
+                    template = dict(chunk)
 
-            content, reasoning, tool_name = self._extract_text(chunk)
-            if tool_name:
-                passthrough_chunks += 1
-                yield raw
-                continue
+                if self._has_finish(chunk):
+                    while buffer:
+                        _, _, sse = buffer.popleft()
+                        if sse:
+                            _mark_emit()
+                            yield sse
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            text = reasoning or content
-            field = "reasoning_content" if reasoning else "content"
-            if not text:
-                passthrough_chunks += 1
-                yield raw
-                continue
+                content, reasoning, tool_name = self._extract_text(chunk)
+                if tool_name:
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            # --- Buffer incoming text ---
-            _buffer_text(text, field)
+                text = reasoning or content
+                field = "reasoning_content" if reasoning else "content"
+                if not text:
+                    passthrough_chunks += 1
+                    yield raw
+                    continue
 
-            elapsed = time.perf_counter() - start_time
+                # --- Buffer incoming text ---
+                _buffer_text(text, field)
 
-            # --- Warmup: just buffer, don't emit yet ---
-            if not warmed and elapsed < self._warmup_secs:
-                continue
+                elapsed = time.perf_counter() - start_time
 
-            # --- Activate ---
-            if not warmed:
-                warmed = True
-                warmup_buffer_chars = len(buffer)
-                _maybe_recalc_interval()
-                logger.info(
-                    "[STREAM-SMOOTH] activate warmup=%.2fs buffered=%d observed_cps=%.1f interval=%.2fms",
-                    elapsed,
-                    warmup_buffer_chars,
-                    _current_rate(),
-                    _emit_interval * 1000.0,
-                )
+                # --- Warmup: just buffer, don't emit yet ---
+                if not warmed and elapsed < self._warmup_secs:
+                    continue
 
-            # --- Drain buffer at measured rate ---
-            while buffer:
-                # Recalc rate periodically (every ~20 chars or when bucket
-                # overfills / underfills)
-                if len(buffer) % 20 == 0 or len(buffer) > self._max_bucket or len(buffer) < 4:
+                # --- Activate ---
+                if not warmed:
+                    warmed = True
+                    warmup_buffer_chars = len(buffer)
                     _maybe_recalc_interval()
+                    logger.info(
+                        "[STREAM-SMOOTH] activate warmup=%.2fs buffered=%d observed_cps=%.1f interval=%.2fms",
+                        elapsed,
+                        warmup_buffer_chars,
+                        _current_rate(),
+                        _emit_interval * 1000.0,
+                    )
 
-                field, ch, sse = buffer.popleft()
+                # --- Drain buffer at measured rate ---
+                while buffer:
+                    # Recalc rate periodically (every ~20 chars or when bucket
+                    # overfills / underfills)
+                    if len(buffer) % 20 == 0 or len(buffer) > self._max_bucket or len(buffer) < 4:
+                        _maybe_recalc_interval()
+
+                    field, ch, sse = buffer.popleft()
+                    if sse:
+                        _mark_emit()
+                        yield sse
+
+                    # If buffer ran dry, wait for more input (skip sleep)
+                    if not buffer:
+                        break
+
+                    # Pace emission at measured rate
+                    remaining = _emit_interval
+                    if remaining > 0 and remaining < 0.5:
+                        _sleep_start = time.perf_counter_ns()
+                        await asyncio.sleep(remaining)
+                        sleep_ns += time.perf_counter_ns() - _sleep_start
+
+            # --- Source exhausted; drain remaining buffer ---
+            while buffer:
+                _, _, sse = buffer.popleft()
                 if sse:
                     _mark_emit()
                     yield sse
 
-                # If buffer ran dry, wait for more input (skip sleep)
-                if not buffer:
-                    break
+            total_elapsed = time.perf_counter() - start_time
+            emit_elapsed = (
+                (last_emit_time - first_emit_time)
+                if first_emit_time is not None and last_emit_time is not None and last_emit_time > first_emit_time
+                else 0.0
+            )
+            logger.info(
+                "[STREAM-SMOOTH] source_chunks=%d passthrough=%d input_chars=%d emitted_chars=%d "
+                "peak_buffer=%d warmup_buffer=%d emit_cps=%.1f total_cps=%.1f sleep=%.1fms warmup=%.2fs "
+                "rate_window=%.2fs max_bucket=%d",
+                source_chunks,
+                passthrough_chunks,
+                total_buffered,
+                emitted_chars,
+                peak_buffer,
+                warmup_buffer_chars,
+                emitted_chars / emit_elapsed if emit_elapsed > 0 else 0.0,
+                emitted_chars / total_elapsed if total_elapsed > 0 else 0.0,
+                sleep_ns / 1e6,
+                self._warmup_secs,
+                self._rate_window,
+                self._max_bucket,
+            )
 
-                # Pace emission at measured rate
-                remaining = _emit_interval
-                if remaining > 0 and remaining < 0.5:
-                    _sleep_start = time.perf_counter_ns()
-                    await asyncio.sleep(remaining)
-                    sleep_ns += time.perf_counter_ns() - _sleep_start
-
-        # --- Source exhausted; drain remaining buffer ---
-        while buffer:
-            _, _, sse = buffer.popleft()
-            if sse:
-                _mark_emit()
-                yield sse
-
-        total_elapsed = time.perf_counter() - start_time
-        emit_elapsed = (
-            (last_emit_time - first_emit_time)
-            if first_emit_time is not None and last_emit_time is not None and last_emit_time > first_emit_time
-            else 0.0
-        )
-        logger.info(
-            "[STREAM-SMOOTH] source_chunks=%d passthrough=%d input_chars=%d emitted_chars=%d "
-            "peak_buffer=%d warmup_buffer=%d emit_cps=%.1f total_cps=%.1f sleep=%.1fms warmup=%.2fs "
-            "rate_window=%.2fs max_bucket=%d",
-            source_chunks,
-            passthrough_chunks,
-            total_buffered,
-            emitted_chars,
-            peak_buffer,
-            warmup_buffer_chars,
-            emitted_chars / emit_elapsed if emit_elapsed > 0 else 0.0,
-            emitted_chars / total_elapsed if total_elapsed > 0 else 0.0,
-            sleep_ns / 1e6,
-            self._warmup_secs,
-            self._rate_window,
-            self._max_bucket,
-        )
+        except GeneratorExit:
+            logger.warning(
+                f"[STREAM-SMOOTH] ** GeneratorExit (client stopped reading) after "
+                f"source_chunks={source_chunks} emitted_chars={emitted_chars}, buffer_remaining={len(buffer)}"
+            )
+            raise
