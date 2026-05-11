@@ -133,9 +133,16 @@ async def stream_completion(
         max_tokens=_resolve_max_tokens(request.max_tokens),
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
-        top_k=_resolve_top_k(request.top_k),
+        top_k=_resolve_top_k(getattr(request, "top_k", None)),
         stop=request.stop,
     ):
+        # ── Custom SSE progress events ──
+        if getattr(output, "progress", None):
+            progress_payload = json.dumps(output.progress)
+            yield f"event: progress\ndata: {progress_payload}\n\n"
+            if not output.new_text and not output.text:
+                continue
+
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",

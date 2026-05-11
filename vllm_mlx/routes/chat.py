@@ -829,6 +829,17 @@ async def stream_chat_completion(
 
         # Stream content — PostProcessor handles reasoning/tool/sanitize
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            # ── Custom SSE progress events for prefill/decode stats ──
+            if getattr(output, "progress", None):
+                progress_payload = json.dumps(output.progress)
+                _yield_start_ns = time.perf_counter_ns()
+                stream_sse_chunks += 1
+                yield f"event: progress\ndata: {progress_payload}\n\n"
+                stream_sse_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
+                # Don't feed progress-only outputs to the post-processor
+                if not output.new_text and not output.text:
+                    continue
+
             stream_output_count += 1
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens

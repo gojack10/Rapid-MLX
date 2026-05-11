@@ -202,6 +202,56 @@ class DFlashMlxEngine(BatchedEngine):
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
 
+    # ------------------------------------------------------------------ progress file
+    _progress_file: str = "/tmp/dflash-progress.json"
+    _progress_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+    _last_progress_json: str | None = None
+
+    @staticmethod
+    def _write_progress(progress: dict) -> None:
+        """Non-blocking write of progress to temp file for pi extension."""
+        import json as _json
+        # Skip if no change (dedup saves I/O)
+        new_json = _json.dumps(progress)
+        if new_json == DFlashMlxEngine._last_progress_json:
+            return
+        DFlashMlxEngine._last_progress_json = new_json
+        # Offload the actual write to a background thread
+        if DFlashMlxEngine._progress_executor is None:
+            import concurrent.futures
+            DFlashMlxEngine._progress_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="progress-writer"
+            )
+        DFlashMlxEngine._progress_executor.submit(
+            DFlashMlxEngine._write_progress_sync, new_json
+        )
+
+    @staticmethod
+    def _write_progress_sync(json_str: str) -> None:
+        """Actual file write (runs in background thread)."""
+        import os as _os
+        try:
+            tmp = DFlashMlxEngine._progress_file + ".tmp"
+            with open(tmp, "w") as _f:
+                _f.write(json_str)
+            _os.replace(tmp, DFlashMlxEngine._progress_file)
+        except Exception:
+            pass
+
+    @classmethod
+    def _clear_progress(cls) -> None:
+        cls._last_progress_json = None
+        if cls._progress_executor is not None:
+            cls._progress_executor.submit(cls._remove_progress_file)
+
+    @staticmethod
+    def _remove_progress_file() -> None:
+        try:
+            import os as _os
+            _os.remove(DFlashMlxEngine._progress_file)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ chat template
     def build_prompt(self, messages, tools=None, enable_thinking=None):
         from ..api.tool_calling import convert_tools_for_template
@@ -349,7 +399,44 @@ class DFlashMlxEngine(BatchedEngine):
 
             event_process_start_ns = time.perf_counter_ns()
             ename = event.get("event", "")
-            if ename == "token":
+            if ename == "prefill_progress":
+                processed = int(event.get("tokens_processed", 0))
+                total = int(event.get("tokens_total", 0))
+                wall_us = float(event.get("wall_us", 0))
+                progress_tok_s = processed / (wall_us / 1_000_000.0) if wall_us > 0 else 0.0
+                event_process_ns += time.perf_counter_ns() - event_process_start_ns
+                yield GenerationOutput(
+                    text=full_text, new_text="",
+                    prompt_tokens=prompt_tokens, completion_tokens=0,
+                    finished=False, finish_reason=None,
+                    progress={
+                        "phase": "prefill",
+                        "processed": processed,
+                        "total": total,
+                        "tok_s": progress_tok_s,
+                    },
+                )
+                self._write_progress({"phase": "prefill", "processed": processed, "total": total, "tok_s": progress_tok_s})
+                continue
+            elif ename == "prefill":
+                prefill_tok_s = float(event.get("prefill_tok_s", 0))
+                prompt_total = int(event.get("prompt_token_count", prompt_tokens))
+                event_process_ns += time.perf_counter_ns() - event_process_start_ns
+                yield GenerationOutput(
+                    text=full_text, new_text="",
+                    prompt_tokens=prompt_tokens, completion_tokens=0,
+                    finished=False, finish_reason=None,
+                    progress={
+                        "phase": "prefill_done",
+                        "processed": prompt_total,
+                        "total": prompt_total,
+                        "tok_s": prefill_tok_s,
+                    },
+                )
+                self._write_progress({"phase": "prefill_done", "processed": prompt_total, "total": prompt_total, "tok_s": prefill_tok_s})
+                prefill_event_wall_ns = time.perf_counter_ns()
+                continue
+            elif ename == "token":
                 token_id = int(event.get("token_id", 0))
                 decode_start_ns = time.perf_counter_ns()
                 token_text = _decoder.decode([token_id])
@@ -372,19 +459,28 @@ class DFlashMlxEngine(BatchedEngine):
                 if first_token_wall_ns == 0:
                     first_token_wall_ns = now_ns
                 last_token_wall_ns = now_ns
+                decode_elapsed_us = float(event.get("decode_elapsed_us", 0))
+                decode_tok_s = completion_tokens / (decode_elapsed_us / 1_000_000.0) if decode_elapsed_us > 0 else 0.0
+                acceptance_pct = min(100.0, float(event.get("acceptance_ratio", 0)) * 100.0)
                 event_process_ns += now_ns - event_process_start_ns
                 token_output = GenerationOutput(
                     text=full_text, new_text=token_text,
                     prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                     cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
                     finished=False, finish_reason=None,
+                    progress={
+                        "phase": "decode",
+                        "tokens": completion_tokens,
+                        "tok_s": decode_tok_s,
+                        "acceptance_pct": acceptance_pct,
+                    },
                 )
+                if completion_tokens % 5 == 0 or completion_tokens <= 3:
+                    self._write_progress({"phase": "decode", "tokens": completion_tokens, "tok_s": decode_tok_s, "acceptance_pct": acceptance_pct})
                 _yield_start_ns = time.perf_counter_ns()
                 yield token_output
                 token_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
                 continue
-            elif ename == "prefill":
-                prefill_event_wall_ns = time.perf_counter_ns()
             elif ename == "cycle_complete":
                 diagnostics_mode = getattr(
                     getattr(self._runtime_context, "diagnostics", None), "mode", "off"
@@ -531,6 +627,7 @@ class DFlashMlxEngine(BatchedEngine):
             finished=True,
             finish_reason=finish_reason,
         )
+        self._clear_progress()
 
     # ------------------------------------------------------------------ prefix cache
     def _build_prefix_flow(self, tokenizer, prompt_ids):

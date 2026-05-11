@@ -30,6 +30,8 @@ class GenerationOutput:
     logprobs: Any = None
     # Semantic channel: "content", "reasoning", "tool_call", or None
     channel: str | None = None
+    # Prefill/decode progress metadata (not a text token — route emits as SSE progress event)
+    progress: dict[str, Any] | None = None
 
 
 class BaseEngine(ABC):
