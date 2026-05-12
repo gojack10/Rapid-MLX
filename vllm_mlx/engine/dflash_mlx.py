@@ -309,6 +309,8 @@ class DFlashMlxEngine(BatchedEngine):
         queue_wait_ns = 0
         worker_started = threading.Event()
 
+        _worker_abort = threading.Event()
+
         def _worker() -> None:
             nonlocal queue_wait_ns
             queue_wait_ns = time.perf_counter_ns() - request_wall_start_ns
@@ -330,6 +332,9 @@ class DFlashMlxEngine(BatchedEngine):
                     temperature=float(temperature),
                     top_p=float(top_p),
                 ):
+                    if _worker_abort.is_set():
+                        logger.warning("[DFLASH-WORKER] abort signal received, stopping")
+                        break
                     ename = event.get("event", "")
                     if ename == "prefill_snapshot_ready" and handler:
                         handler.handle_prefill_snapshot(event)
@@ -387,155 +392,169 @@ class DFlashMlxEngine(BatchedEngine):
         token_yield_pause_ns = 0
         max_queue_depth = 0
 
-        while True:
-            _q_wait_start_ns = time.perf_counter_ns()
-            event = await q.get()
-            q_get_wait_ns += time.perf_counter_ns() - _q_wait_start_ns
-            max_queue_depth = max(max_queue_depth, q.qsize())
-            if event is None:
-                break
-            if isinstance(event, dict) and "__error__" in event:
-                raise event["__error__"]
+        _cancelled = False
+        try:
+            while True:
+                _q_wait_start_ns = time.perf_counter_ns()
+                event = await q.get()
+                q_get_wait_ns += time.perf_counter_ns() - _q_wait_start_ns
+                max_queue_depth = max(max_queue_depth, q.qsize())
+                if event is None:
+                    break
+                if isinstance(event, dict) and "__error__" in event:
+                    raise event["__error__"]
 
-            event_process_start_ns = time.perf_counter_ns()
-            ename = event.get("event", "")
-            if ename == "prefill_progress":
-                processed = int(event.get("tokens_processed", 0))
-                total = int(event.get("tokens_total", 0))
-                wall_us = float(event.get("wall_us", 0))
-                progress_tok_s = processed / (wall_us / 1_000_000.0) if wall_us > 0 else 0.0
+                event_process_start_ns = time.perf_counter_ns()
+                ename = event.get("event", "")
+                if ename == "prefill_progress":
+                    processed = int(event.get("tokens_processed", 0))
+                    total = int(event.get("tokens_total", 0))
+                    wall_us = float(event.get("wall_us", 0))
+                    progress_tok_s = processed / (wall_us / 1_000_000.0) if wall_us > 0 else 0.0
+                    event_process_ns += time.perf_counter_ns() - event_process_start_ns
+                    yield GenerationOutput(
+                        text=full_text, new_text="",
+                        prompt_tokens=prompt_tokens, completion_tokens=0,
+                        finished=False, finish_reason=None,
+                        progress={
+                            "phase": "prefill",
+                            "processed": processed,
+                            "total": total,
+                            "tok_s": progress_tok_s,
+                        },
+                    )
+                    self._write_progress({"phase": "prefill", "processed": processed, "total": total, "tok_s": progress_tok_s})
+                    continue
+                elif ename == "prefill":
+                    prefill_tok_s = float(event.get("prefill_tok_s", 0))
+                    prompt_total = int(event.get("prompt_token_count", prompt_tokens))
+                    event_process_ns += time.perf_counter_ns() - event_process_start_ns
+                    yield GenerationOutput(
+                        text=full_text, new_text="",
+                        prompt_tokens=prompt_tokens, completion_tokens=0,
+                        finished=False, finish_reason=None,
+                        progress={
+                            "phase": "prefill_done",
+                            "processed": prompt_total,
+                            "total": prompt_total,
+                            "tok_s": prefill_tok_s,
+                        },
+                    )
+                    self._write_progress({"phase": "prefill_done", "processed": prompt_total, "total": prompt_total, "tok_s": prefill_tok_s})
+                    prefill_event_wall_ns = time.perf_counter_ns()
+                    continue
+                elif ename == "token":
+                    token_id = int(event.get("token_id", 0))
+                    decode_start_ns = time.perf_counter_ns()
+                    token_text = _decoder.decode([token_id])
+                    token_decode_ns += time.perf_counter_ns() - decode_start_ns
+                    full_text += token_text
+                    completion_tokens = int(event.get("generated_tokens", completion_tokens + 1))
+                    if token_id in stop_token_ids:
+                        finish_reason = "stop"
+                        logger.info(
+                            "[DFlash-MLX] EOS hit: token=%d text=%r at pos %d",
+                            token_id, token_text, completion_tokens,
+                        )
+                    # Log every 500th token for sampling
+                    if completion_tokens % 500 == 0:
+                        logger.info(
+                            "[DFlash-MLX] token %d: id=%d text=%r",
+                            completion_tokens, token_id, token_text,
+                        )
+                    now_ns = time.perf_counter_ns()
+                    if first_token_wall_ns == 0:
+                        first_token_wall_ns = now_ns
+                    last_token_wall_ns = now_ns
+                    decode_elapsed_us = float(event.get("decode_elapsed_us", 0))
+                    decode_tok_s = completion_tokens / (decode_elapsed_us / 1_000_000.0) if decode_elapsed_us > 0 else 0.0
+                    acceptance_pct = min(100.0, float(event.get("acceptance_ratio", 0)) * 100.0)
+                    event_process_ns += now_ns - event_process_start_ns
+                    token_output = GenerationOutput(
+                        text=full_text, new_text=token_text,
+                        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                        cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
+                        finished=False, finish_reason=None,
+                        progress={
+                            "phase": "decode",
+                            "tokens": completion_tokens,
+                            "tok_s": decode_tok_s,
+                            "acceptance_pct": acceptance_pct,
+                        },
+                    )
+                    if completion_tokens % 5 == 0 or completion_tokens <= 3:
+                        self._write_progress({"phase": "decode", "tokens": completion_tokens, "tok_s": decode_tok_s, "acceptance_pct": acceptance_pct})
+                    _yield_start_ns = time.perf_counter_ns()
+                    yield token_output
+                    token_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
+                    continue
+                elif ename == "cycle_complete":
+                    diagnostics_mode = getattr(
+                        getattr(self._runtime_context, "diagnostics", None), "mode", "off"
+                    )
+                    if diagnostics_mode == "full":
+                        cycle_fields = {k: v for k, v in event.items() if k != "event"}
+                        logger.info(
+                            "[DFlash-MLX] cycle_profile %s",
+                            json.dumps(cycle_fields, separators=(",", ":"), default=str),
+                        )
+                elif ename == "summary":
+                    completion_tokens = int(event.get("generation_tokens", completion_tokens))
+                    finish_reason = event.get("finish_reason", "stop")
+                    logger.info(
+                        "[DFlash-MLX] summary: tokens=%d finish=%s generated_ids_last10=%s",
+                        completion_tokens, finish_reason,
+                        event.get("generated_token_ids", [])[-10:] if event.get("generated_token_ids") else [],
+                    )
+                    ddtree_totals = event.get("ddtree_profile_totals_us", {})
+                    if ddtree_totals:
+                        logger.info(
+                            "[DFlash-MLX] ddtree_profile_us %s",
+                            json.dumps(
+                                {k: round(float(v), 1) for k, v in ddtree_totals.items()},
+                                separators=(",", ":"),
+                            ),
+                        )
+                    dflash_accepted = int(event.get("accepted_from_draft", 0))
+                    dflash_cycles = int(event.get("cycles_completed", 0))
+                    dflash_elapsed_us = float(event.get("elapsed_us", 0))
+                    dflash_acceptance = float(event.get("acceptance_ratio", 0))
+                    dflash_tokens_per_cycle = float(event.get("tokens_per_cycle", 0) or 0)
+                    dflash_peak_memory_gb = event.get("peak_memory_gb")
+                    dflash_post_prefill_wall_tps = float(event.get("post_prefill_wall_tps", 0) or 0)
+                    dflash_post_prefill_core_tps = float(event.get("post_prefill_core_tps", 0) or 0)
+                    dflash_decode_to_last_wall_tps = float(event.get("decode_to_last_token_wall_tps", 0) or 0)
+                    dflash_decode_to_last_core_tps = float(event.get("decode_to_last_token_core_tps", 0) or 0)
+                    dflash_cycle_wall_ms = float(event.get("cycle_wall_ms", 0) or 0)
+                    dflash_cycle_core_ms = float(event.get("cycle_core_ms", 0) or 0)
+                    dflash_cycle_measured_avg_ms = float(event.get("cycle_measured_avg_ms", 0) or 0)
+                    dflash_decode_timings_us = dict(event.get("decode_timings_us", {}) or {})
+                    dflash_ddtree_summary = dict(event.get("ddtree", {}) or {})
+                    dflash_ddtree_timing_avg_us = dict(event.get("ddtree_timing_avg_us", {}) or {})
+                    dflash_ddtree_timing_totals_us = dict(event.get("ddtree_timing_totals_us", {}) or {})
+                    dflash_prefetch = dict(event.get("prefetch", {}) or {})
+                    phase = event.get("phase_timings_us", {})
+                    if isinstance(phase, dict):
+                        dflash_prefill_us = float(phase.get("prefill", 0))
+                        dflash_draft_us = float(phase.get("draft", 0))
+                        dflash_verify_us = float(phase.get("verify", 0))
+                        dflash_replay_us = float(phase.get("replay", 0))
+                        dflash_commit_us = float(phase.get("commit", 0))
+                        dflash_generation_snapshot_us = float(phase.get("generation_snapshot", 0))
+                        dflash_yield_pause_us = float(phase.get("yield_pause", 0))
                 event_process_ns += time.perf_counter_ns() - event_process_start_ns
-                yield GenerationOutput(
-                    text=full_text, new_text="",
-                    prompt_tokens=prompt_tokens, completion_tokens=0,
-                    finished=False, finish_reason=None,
-                    progress={
-                        "phase": "prefill",
-                        "processed": processed,
-                        "total": total,
-                        "tok_s": progress_tok_s,
-                    },
-                )
-                self._write_progress({"phase": "prefill", "processed": processed, "total": total, "tok_s": progress_tok_s})
-                continue
-            elif ename == "prefill":
-                prefill_tok_s = float(event.get("prefill_tok_s", 0))
-                prompt_total = int(event.get("prompt_token_count", prompt_tokens))
-                event_process_ns += time.perf_counter_ns() - event_process_start_ns
-                yield GenerationOutput(
-                    text=full_text, new_text="",
-                    prompt_tokens=prompt_tokens, completion_tokens=0,
-                    finished=False, finish_reason=None,
-                    progress={
-                        "phase": "prefill_done",
-                        "processed": prompt_total,
-                        "total": prompt_total,
-                        "tok_s": prefill_tok_s,
-                    },
-                )
-                self._write_progress({"phase": "prefill_done", "processed": prompt_total, "total": prompt_total, "tok_s": prefill_tok_s})
-                prefill_event_wall_ns = time.perf_counter_ns()
-                continue
-            elif ename == "token":
-                token_id = int(event.get("token_id", 0))
-                decode_start_ns = time.perf_counter_ns()
-                token_text = _decoder.decode([token_id])
-                token_decode_ns += time.perf_counter_ns() - decode_start_ns
-                full_text += token_text
-                completion_tokens = int(event.get("generated_tokens", completion_tokens + 1))
-                if token_id in stop_token_ids:
-                    finish_reason = "stop"
-                    logger.info(
-                        "[DFlash-MLX] EOS hit: token=%d text=%r at pos %d",
-                        token_id, token_text, completion_tokens,
-                    )
-                # Log every 500th token for sampling
-                if completion_tokens % 500 == 0:
-                    logger.info(
-                        "[DFlash-MLX] token %d: id=%d text=%r",
-                        completion_tokens, token_id, token_text,
-                    )
-                now_ns = time.perf_counter_ns()
-                if first_token_wall_ns == 0:
-                    first_token_wall_ns = now_ns
-                last_token_wall_ns = now_ns
-                decode_elapsed_us = float(event.get("decode_elapsed_us", 0))
-                decode_tok_s = completion_tokens / (decode_elapsed_us / 1_000_000.0) if decode_elapsed_us > 0 else 0.0
-                acceptance_pct = min(100.0, float(event.get("acceptance_ratio", 0)) * 100.0)
-                event_process_ns += now_ns - event_process_start_ns
-                token_output = GenerationOutput(
-                    text=full_text, new_text=token_text,
-                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                    cached_tokens=int(prefix_flow.get("hit_tokens", 0) or 0),
-                    finished=False, finish_reason=None,
-                    progress={
-                        "phase": "decode",
-                        "tokens": completion_tokens,
-                        "tok_s": decode_tok_s,
-                        "acceptance_pct": acceptance_pct,
-                    },
-                )
-                if completion_tokens % 5 == 0 or completion_tokens <= 3:
-                    self._write_progress({"phase": "decode", "tokens": completion_tokens, "tok_s": decode_tok_s, "acceptance_pct": acceptance_pct})
-                _yield_start_ns = time.perf_counter_ns()
-                yield token_output
-                token_yield_pause_ns += time.perf_counter_ns() - _yield_start_ns
-                continue
-            elif ename == "cycle_complete":
-                diagnostics_mode = getattr(
-                    getattr(self._runtime_context, "diagnostics", None), "mode", "off"
-                )
-                if diagnostics_mode == "full":
-                    cycle_fields = {k: v for k, v in event.items() if k != "event"}
-                    logger.info(
-                        "[DFlash-MLX] cycle_profile %s",
-                        json.dumps(cycle_fields, separators=(",", ":"), default=str),
-                    )
-            elif ename == "summary":
-                completion_tokens = int(event.get("generation_tokens", completion_tokens))
-                finish_reason = event.get("finish_reason", "stop")
-                logger.info(
-                    "[DFlash-MLX] summary: tokens=%d finish=%s generated_ids_last10=%s",
-                    completion_tokens, finish_reason,
-                    event.get("generated_token_ids", [])[-10:] if event.get("generated_token_ids") else [],
-                )
-                ddtree_totals = event.get("ddtree_profile_totals_us", {})
-                if ddtree_totals:
-                    logger.info(
-                        "[DFlash-MLX] ddtree_profile_us %s",
-                        json.dumps(
-                            {k: round(float(v), 1) for k, v in ddtree_totals.items()},
-                            separators=(",", ":"),
-                        ),
-                    )
-                dflash_accepted = int(event.get("accepted_from_draft", 0))
-                dflash_cycles = int(event.get("cycles_completed", 0))
-                dflash_elapsed_us = float(event.get("elapsed_us", 0))
-                dflash_acceptance = float(event.get("acceptance_ratio", 0))
-                dflash_tokens_per_cycle = float(event.get("tokens_per_cycle", 0) or 0)
-                dflash_peak_memory_gb = event.get("peak_memory_gb")
-                dflash_post_prefill_wall_tps = float(event.get("post_prefill_wall_tps", 0) or 0)
-                dflash_post_prefill_core_tps = float(event.get("post_prefill_core_tps", 0) or 0)
-                dflash_decode_to_last_wall_tps = float(event.get("decode_to_last_token_wall_tps", 0) or 0)
-                dflash_decode_to_last_core_tps = float(event.get("decode_to_last_token_core_tps", 0) or 0)
-                dflash_cycle_wall_ms = float(event.get("cycle_wall_ms", 0) or 0)
-                dflash_cycle_core_ms = float(event.get("cycle_core_ms", 0) or 0)
-                dflash_cycle_measured_avg_ms = float(event.get("cycle_measured_avg_ms", 0) or 0)
-                dflash_decode_timings_us = dict(event.get("decode_timings_us", {}) or {})
-                dflash_ddtree_summary = dict(event.get("ddtree", {}) or {})
-                dflash_ddtree_timing_avg_us = dict(event.get("ddtree_timing_avg_us", {}) or {})
-                dflash_ddtree_timing_totals_us = dict(event.get("ddtree_timing_totals_us", {}) or {})
-                dflash_prefetch = dict(event.get("prefetch", {}) or {})
-                phase = event.get("phase_timings_us", {})
-                if isinstance(phase, dict):
-                    dflash_prefill_us = float(phase.get("prefill", 0))
-                    dflash_draft_us = float(phase.get("draft", 0))
-                    dflash_verify_us = float(phase.get("verify", 0))
-                    dflash_replay_us = float(phase.get("replay", 0))
-                    dflash_commit_us = float(phase.get("commit", 0))
-                    dflash_generation_snapshot_us = float(phase.get("generation_snapshot", 0))
-                    dflash_yield_pause_us = float(phase.get("yield_pause", 0))
-            event_process_ns += time.perf_counter_ns() - event_process_start_ns
+        except GeneratorExit:
+            _cancelled = True
+            logger.warning("[DFLASH-STREAM] ** GeneratorExit — aborting DFlash worker thread!")
+            raise
+        except asyncio.CancelledError:
+            _cancelled = True
+            logger.warning("[DFLASH-STREAM] ** CancelledError — aborting DFlash worker thread!")
+            raise
+        finally:
+            if _cancelled:
+                logger.warning("[DFLASH-STREAM] signalling worker abort event")
+                _worker_abort.set()
 
         self._total_requests += 1
         self._total_tokens += completion_tokens
