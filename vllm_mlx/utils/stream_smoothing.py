@@ -200,6 +200,10 @@ class SmoothingIterator:
         tc_chunks = 0
         pending_tc_start_raw: str | None = None
         pending_tc_start_meta: str | None = None
+        # First TC arg fragment while waiting for a second one so we can emit
+        # a combined chunk that `partial-json` can parse into {command: "..."}
+        # instead of {} which renders as "$ ..." in pi's bash renderer.
+        pending_first_arg: tuple[str, int] | None = None
         peak_buffer = 0
         sleep_ns = 0
         warmup_buffer_chars = 0
@@ -276,7 +280,7 @@ class SmoothingIterator:
 
                 if "[DONE]" in raw:
                     done = True
-                    while buffer or tc_buffer or pending_tc_start_raw is not None:
+                    while buffer or tc_buffer or pending_tc_start_raw is not None or pending_first_arg is not None:
                         if buffer:
                             _, _, sse = buffer.popleft()
                             if sse:
@@ -288,6 +292,16 @@ class SmoothingIterator:
                                 pending_tc_start_raw = None
                                 passthrough_chunks += 1
                             arg_frag, tc_idx = tc_buffer.popleft()
+                            _mark_emit()
+                            yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                        elif pending_first_arg is not None:
+                            # Lone pending first arg — flush with TC start
+                            if pending_tc_start_raw is not None:
+                                yield pending_tc_start_raw
+                                pending_tc_start_raw = None
+                                passthrough_chunks += 1
+                            arg_frag, tc_idx = pending_first_arg
+                            pending_first_arg = None
                             _mark_emit()
                             yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
                         elif pending_tc_start_raw is not None:
@@ -308,7 +322,7 @@ class SmoothingIterator:
                     template = dict(chunk)
 
                 if self._has_finish(chunk):
-                    while buffer or tc_buffer or pending_tc_start_raw is not None:
+                    while buffer or tc_buffer or pending_tc_start_raw is not None or pending_first_arg is not None:
                         if buffer:
                             _, _, sse = buffer.popleft()
                             if sse:
@@ -320,6 +334,15 @@ class SmoothingIterator:
                                 pending_tc_start_raw = None
                                 passthrough_chunks += 1
                             arg_frag, tc_idx = tc_buffer.popleft()
+                            _mark_emit()
+                            yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                        elif pending_first_arg is not None:
+                            if pending_tc_start_raw is not None:
+                                yield pending_tc_start_raw
+                                pending_tc_start_raw = None
+                                passthrough_chunks += 1
+                            arg_frag, tc_idx = pending_first_arg
+                            pending_first_arg = None
                             _mark_emit()
                             yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
                         elif pending_tc_start_raw is not None:
@@ -336,16 +359,44 @@ class SmoothingIterator:
                     # Don't yield yet — save for just-in-time emission
                     # right before the first TC arg fragment so the
                     # client never sees an empty "$ ..." component.
+                    #
+                    # If we already have a pending start + held first arg
+                    # (multi-tool with single-fragment args), flush before
+                    # saving the new one.
+                    if pending_tc_start_raw is not None and pending_first_arg is not None:
+                        # Emit pending TC start + lone first arg immediately
+                        yield pending_tc_start_raw
+                        pending_tc_start_raw = None
+                        passthrough_chunks += 1
+                        arg_frag, tc_idx = pending_first_arg
+                        pending_first_arg = None
+                        _mark_emit()
+                        yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
                     pending_tc_start_raw = raw
                     pending_tc_start_meta = tc_start[0]
                     continue
 
                 tc_arg = self._extract_tc_arg(chunk)
                 if tc_arg is not None:
-                    # Argument fragment: buffer and drain at measured rate
                     arg_fragment, tc_index = tc_arg
                     _record_arrival(len(arg_fragment))
-                    tc_buffer.append((arg_fragment, tc_index))
+                    # When we have a deferred TC start, combine the
+                    # first two arg fragments so the first emitted chunk
+                    # contains enough JSON for parseStreamingJson to
+                    # extract a "command" field.  A single 8-char fragment
+                    # like {"comman always parses as {} → "$ ...".
+                    if pending_tc_start_raw is not None and pending_first_arg is None:
+                        # First arg — hold it until we have more context
+                        pending_first_arg = (arg_fragment, tc_index)
+                        continue  # don't emit or drain yet
+                    elif pending_tc_start_raw is not None and pending_first_arg is not None:
+                        # Second+ arg — combine with pending first
+                        first_frag, first_idx = pending_first_arg
+                        pending_first_arg = None
+                        combined = first_frag + arg_fragment
+                        tc_buffer.append((combined, first_idx))
+                    else:
+                        tc_buffer.append((arg_fragment, tc_index))
                     tc_chunks += 1
                     peak_buffer = max(peak_buffer, len(tc_buffer) + len(buffer))
                 else:
@@ -382,7 +433,7 @@ class SmoothingIterator:
 
                 # --- Drain buffers at measured rate ---
                 drained_tc_last = False
-                while buffer or tc_buffer or pending_tc_start_raw is not None:
+                while buffer or tc_buffer or pending_tc_start_raw is not None or pending_first_arg is not None:
                     # Recalc rate periodically (every ~20 chars or when bucket
                     # overfills / underfills)
                     if len(buffer) % 20 == 0 or len(buffer) > self._max_bucket or len(buffer) < 4:
@@ -406,6 +457,17 @@ class SmoothingIterator:
                         drained_tc_last = True
                         _mark_emit()
                         yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                    elif pending_first_arg is not None:
+                        # Lone pending first arg — flush with TC start
+                        if pending_tc_start_raw is not None:
+                            yield pending_tc_start_raw
+                            pending_tc_start_raw = None
+                            passthrough_chunks += 1
+                        arg_frag, tc_idx = pending_first_arg
+                        pending_first_arg = None
+                        drained_tc_last = True
+                        _mark_emit()
+                        yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
                     elif buffer:
                         field, ch, sse = buffer.popleft()
                         drained_tc_last = False
@@ -414,7 +476,7 @@ class SmoothingIterator:
                             yield sse
 
                     # If nothing left to drain and no pending TC start, wait for more input
-                    if not buffer and not tc_buffer and pending_tc_start_raw is None:
+                    if not buffer and not tc_buffer and pending_tc_start_raw is None and pending_first_arg is None:
                         break
 
                     # Pace emission at measured rate
@@ -425,7 +487,7 @@ class SmoothingIterator:
                         sleep_ns += time.perf_counter_ns() - _sleep_start
 
             # --- Source exhausted; drain remaining buffers ---
-            while buffer or tc_buffer or pending_tc_start_raw is not None:
+            while buffer or tc_buffer or pending_tc_start_raw is not None or pending_first_arg is not None:
                 if pending_tc_start_raw is not None and tc_buffer:
                     yield pending_tc_start_raw
                     pending_tc_start_raw = None
@@ -441,6 +503,15 @@ class SmoothingIterator:
                         yield sse
                 elif tc_buffer:
                     arg_frag, tc_idx = tc_buffer.popleft()
+                    _mark_emit()
+                    yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                elif pending_first_arg is not None:
+                    if pending_tc_start_raw is not None:
+                        yield pending_tc_start_raw
+                        pending_tc_start_raw = None
+                        passthrough_chunks += 1
+                    arg_frag, tc_idx = pending_first_arg
+                    pending_first_arg = None
                     _mark_emit()
                     yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
 

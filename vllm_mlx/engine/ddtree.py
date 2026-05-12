@@ -47,6 +47,7 @@ def build_ddtree_tree_from_topk(
     min_cumulative_log_prob: float = float('-inf'),
     max_depth: int = 0,
     depth_penalty: float = 0.0,
+    truncate_logw: float = float('-inf'),
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -60,6 +61,8 @@ def build_ddtree_tree_from_topk(
             length so budget is spent on branching at shallow depths.
         depth_penalty: Per-depth penalty added to child cumulative score.
             Makes deeper nodes slightly less attractive. 0.0 = no penalty.
+        truncate_logw: After building, truncate tree at first node whose
+            cumulative logw falls below this value.  Post-construction cutoff.
 
     Returns:
         DDTree with up to *budget* tree nodes.
@@ -90,6 +93,7 @@ def build_ddtree_tree_from_topk(
 
     node_token_ids = np.empty(budget, dtype=np.int64)
     node_depths = np.empty(budget, dtype=np.int64)
+    node_logws = np.empty(budget, dtype=np.float32)
     parents = np.empty(budget + 1, dtype=np.int32)
     parents[0] = -1
     child_maps: list[dict[int, int]] = [{}]
@@ -102,6 +106,7 @@ def build_ddtree_tree_from_topk(
         current_index = node_count + 1
         node_token_ids[node_count] = token_id
         node_depths[node_count] = depth
+        node_logws[node_count] = logw
         parents[current_index] = parent_index
         child_maps.append({})
         child_maps[parent_index][token_id] = current_index
@@ -144,6 +149,28 @@ def build_ddtree_tree_from_topk(
                         child_logw,
                     ),
                 )
+
+    # ── Truncation at acceptance cliff ──
+    if truncate_logw > float('-inf') and node_count > 0:
+        cutoff = node_count
+        for i in range(node_count):
+            if node_logws[i] < truncate_logw:
+                cutoff = i
+                break
+        if cutoff < node_count:
+            # Rebuild for truncated tree: keep first `cutoff` nodes,
+            # remap parents, rebuild child_maps from scratch.
+            node_count = cutoff
+            # Fix parents: any parent_idx > node_count → root (orphan)
+            for i in range(1, node_count + 1):
+                if parents[i] > node_count:
+                    parents[i] = 0
+            # Rebuild child_maps for kept nodes only
+            child_maps = [{} for _ in range(node_count + 1)]
+            for i in range(1, node_count + 1):
+                pi = int(parents[i])
+                tid = int(node_token_ids[i - 1])
+                child_maps[pi][tid] = i
 
     # Build visibility matrix (ancestor-only attention mask).
     # Node i can attend to node j iff j is an ancestor of i (or j == i).
@@ -213,6 +240,8 @@ def build_ddtree_tree_from_mlx_topk(
     min_cumulative_log_prob: float = float('-inf'),
     max_depth: int = 0,
     depth_penalty: float = 0.0,
+    dynamic_threshold: str = "",
+    truncate_logw: float = float('-inf'),
 ) -> DDTree:
     """Build a DDTree from MLX top-k token IDs/log-probs.
 
@@ -245,6 +274,17 @@ def build_ddtree_tree_from_mlx_topk(
         _phase_start = time.perf_counter_ns()
     ids_np = np.array(top_token_ids.tolist(), dtype=np.int64)
     probs_np = np.array(top_log_probs.tolist(), dtype=np.float32)
+
+    # ── Dynamic threshold: override min_cumulative_log_prob from data ──
+    effective_threshold = float(min_cumulative_log_prob)
+    if dynamic_threshold:
+        if dynamic_threshold == "mean_top1_x40":
+            mean_top1 = float(np.mean(probs_np[:, 0]))
+            effective_threshold = mean_top1 * 40.0
+        elif dynamic_threshold == "pos1_top1_x30":
+            effective_threshold = float(probs_np[0, 0]) * 30.0
+    # ────────────────────────────────────────────────────────────────────
+
     if profile is not None:
         _profile_add("topk_transfer_ns", time.perf_counter_ns() - _phase_start)
         _phase_start = time.perf_counter_ns()
@@ -252,9 +292,10 @@ def build_ddtree_tree_from_mlx_topk(
         top_token_ids=ids_np,
         top_log_probs=probs_np,
         budget=budget,
-        min_cumulative_log_prob=min_cumulative_log_prob,
+        min_cumulative_log_prob=effective_threshold,
         max_depth=max_depth,
         depth_penalty=depth_penalty,
+        truncate_logw=truncate_logw,
     )
     if profile is not None:
         _profile_add("heap_build_ns", time.perf_counter_ns() - _phase_start)
