@@ -44,6 +44,7 @@ def build_ddtree_tree_from_topk(
     top_token_ids: np.ndarray,
     top_log_probs: np.ndarray,
     budget: int,
+    min_cumulative_log_prob: float = float('-inf'),
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -51,6 +52,9 @@ def build_ddtree_tree_from_topk(
         top_token_ids: (L, K) int64 array sorted by descending log-probability.
         top_log_probs: (L, K) float32 array aligned with top_token_ids.
         budget: Maximum number of tree nodes (excluding root).
+        min_cumulative_log_prob: Prune paths whose cumulative log-probability
+            falls below this threshold.  Default ``-inf`` (no pruning).
+            Set to e.g. -15 to prune extremely unlikely branches.
 
     Returns:
         DDTree with up to *budget* tree nodes.
@@ -106,33 +110,35 @@ def build_ddtree_tree_from_topk(
                 - float(top_log_probs[depth - 1, rank])
                 + float(top_log_probs[depth - 1, rank + 1])
             )
-            heapq.heappush(
-                heap,
-                (
-                    -sibling_logw,
-                    sibling_ranks,
-                    parent_index,
-                    depth,
-                    rank + 1,
-                    sibling_logw,
-                ),
-            )
+            if sibling_logw >= min_cumulative_log_prob:
+                heapq.heappush(
+                    heap,
+                    (
+                        -sibling_logw,
+                        sibling_ranks,
+                        parent_index,
+                        depth,
+                        rank + 1,
+                        sibling_logw,
+                    ),
+                )
 
         # Push first child (rank 0 at next depth)
         if depth < depth_limit:
             child_ranks = ranks + (0,)
             child_logw = logw + float(top_log_probs[depth, 0])
-            heapq.heappush(
-                heap,
-                (
-                    -child_logw,
-                    child_ranks,
-                    current_index,
-                    depth + 1,
-                    0,
-                    child_logw,
-                ),
-            )
+            if child_logw >= min_cumulative_log_prob:
+                heapq.heappush(
+                    heap,
+                    (
+                        -child_logw,
+                        child_ranks,
+                        current_index,
+                        depth + 1,
+                        0,
+                        child_logw,
+                    ),
+                )
 
     # Build visibility matrix (ancestor-only attention mask).
     # Node i can attend to node j iff j is an ancestor of i (or j == i).
@@ -199,6 +205,7 @@ def build_ddtree_tree_from_mlx_topk(
     top_log_probs: "mx.array",
     budget: int,
     profile: dict | None = None,
+    min_cumulative_log_prob: float = float('-inf'),
 ) -> DDTree:
     """Build a DDTree from MLX top-k token IDs/log-probs.
 
@@ -238,6 +245,7 @@ def build_ddtree_tree_from_mlx_topk(
         top_token_ids=ids_np,
         top_log_probs=probs_np,
         budget=budget,
+        min_cumulative_log_prob=min_cumulative_log_prob,
     )
     if profile is not None:
         _profile_add("heap_build_ns", time.perf_counter_ns() - _phase_start)
