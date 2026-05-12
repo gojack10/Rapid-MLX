@@ -96,7 +96,28 @@ class SmoothingIterator:
             "model": template.get("model", ""),
             "choices": [{"index": 0, "delta": {field: ch}}],
         }
-        return f"data: {json.dumps(out, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        data = json.dumps(out, ensure_ascii=False, separators=(',', ':'))
+        return f"data: {data}\n\n"
+
+    @staticmethod
+    def _build_tc_arg_sse(template: dict, arg_fragment: str, tc_index: int) -> str:
+        out = {
+            "id": template.get("id", ""),
+            "object": template.get("object", "chat.completion.chunk"),
+            "created": template.get("created", 0),
+            "model": template.get("model", ""),
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": tc_index,
+                        "function": {"arguments": arg_fragment},
+                    }]
+                }
+            }],
+        }
+        data = json.dumps(out, ensure_ascii=False, separators=(',', ':'))
+        return f"data: {data}\n\n"
 
     # ------------------------------------------------------------------
     # Cleanup (propagate aclose/GeneratorExit to source)
