@@ -324,7 +324,15 @@ class SmoothingIterator:
 
         except GeneratorExit:
             logger.warning(
-                f"[STREAM-SMOOTH] ** GeneratorExit (client stopped reading) after "
+                f"[STREAM-SMOOTH] ** GeneratorExit after "
                 f"source_chunks={source_chunks} emitted_chars={emitted_chars}, buffer_remaining={len(buffer)}"
             )
+            raise
+        except asyncio.CancelledError:
+            logger.warning(
+                f"[STREAM-SMOOTH] ** CancelledError after "
+                f"source_chunks={source_chunks} emitted_chars={emitted_chars}, buffer_remaining={len(buffer)}"
+            )
+            # Close source so GeneratorExit propagates to engine
+            await self._source.aclose()
             raise

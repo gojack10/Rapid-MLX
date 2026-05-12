@@ -483,7 +483,13 @@ async def _disconnect_guard(
     raw_request: Request,
     poll_interval: float = 0.5,
 ) -> AsyncIterator[str]:
-    """Wrap streaming generator to abort on client disconnect."""
+    """Wrap streaming generator to abort on client disconnect.
+
+    Uses background polling to detect disconnect, then ``break`` from the
+    ``async for`` loop.  Python auto-closes the inner async generator on
+    ``break`` (sends ``GeneratorExit``).  ``CancelledError`` does NOT trigger
+    auto-close in Python 3.12+, so we catch it and call ``aclose()`` manually.
+    """
     import time as _time
 
     _t0 = _time.monotonic()
@@ -493,7 +499,10 @@ async def _disconnect_guard(
 
     logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
 
-    async def _wait_disconnect():
+    _disconnected = False
+
+    async def _monitor():
+        nonlocal _disconnected
         poll_count = 0
         while True:
             await asyncio.sleep(poll_interval)
@@ -505,57 +514,19 @@ async def _disconnect_guard(
                     f"disconnected={is_disc} elapsed={_elapsed()}"
                 )
             if is_disc:
+                _disconnected = True
                 return
 
+    monitor = asyncio.create_task(_monitor())
     chunk_count = 0
-    disconnect_task: asyncio.Task | None = None
-    anext_task: asyncio.Task | None = None
-    try:
-        aiter = generator.__aiter__()
-        disconnect_task = asyncio.create_task(_wait_disconnect())
-        while True:
-            anext_task = asyncio.ensure_future(aiter.__anext__())
-            done, _ = await asyncio.wait(
-                [anext_task, disconnect_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if disconnect_task in done:
-                logger.info(
-                    f"[disconnect_guard] CLIENT DISCONNECTED after "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
-                )
-                anext_task.cancel()
-                try:
-                    await anext_task
-                except (asyncio.CancelledError, StopAsyncIteration):
-                    pass
-                break
-            try:
-                chunk = anext_task.result()
-            except StopAsyncIteration:
-                logger.info(
-                    f"[disconnect_guard] generator exhausted normally, "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
-                )
-                break
-            except Exception as exc:
-                logger.error(
-                    f"[disconnect_guard] generator raised {type(exc).__name__}: "
-                    f"{exc}, {chunk_count} chunks, elapsed={_elapsed()}",
-                    exc_info=True,
-                )
-                import json as _json
 
-                error_data = _json.dumps(
-                    {
-                        "error": {
-                            "message": f"Internal error during streaming: {exc}",
-                            "type": type(exc).__name__,
-                        }
-                    }
+    try:
+        async for chunk in generator:
+            if _disconnected:
+                logger.warning(
+                    f"[disconnect_guard] CLIENT DISCONNECTED after "
+                    f"{chunk_count} chunks, elapsed={_elapsed()} — aborting!"
                 )
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
                 break
             chunk_count += 1
             if chunk_count == 1:
@@ -565,24 +536,40 @@ async def _disconnect_guard(
             yield chunk
     except GeneratorExit:
         logger.warning(
-            f"[disconnect_guard] ** GeneratorExit (client stopped reading) "
-            f"after {chunk_count} chunks, elapsed={_elapsed()} — cancelling generator!"
+            f"[disconnect_guard] ** GeneratorExit after "
+            f"{chunk_count} chunks, elapsed={_elapsed()}"
         )
+    except asyncio.CancelledError:
+        logger.warning(
+            f"[disconnect_guard] ** CancelledError after "
+            f"{chunk_count} chunks, elapsed={_elapsed()} — calling aclose()!"
+        )
+        # async-for does NOT auto-close the iterator on CancelledError
+        # in Python 3.12+.  Close manually so GeneratorExit propagates
+        # down to stream_outputs → abort_request.
+        await generator.aclose()
+        raise
+    except Exception as exc:
+        logger.error(
+            f"[disconnect_guard] generator raised {type(exc).__name__}: "
+            f"{exc}, {chunk_count} chunks, elapsed={_elapsed()}",
+            exc_info=True,
+        )
+        import json as _json
+
+        error_data = _json.dumps(
+            {
+                "error": {
+                    "message": f"Internal error during streaming: {exc}",
+                    "type": type(exc).__name__,
+                }
+            }
+        )
+        yield f"data: {error_data}\n\n"
+        yield "data: [DONE]\n\n"
     finally:
-        if disconnect_task and not disconnect_task.done():
-            disconnect_task.cancel()
-        if anext_task and not anext_task.done():
-            anext_task.cancel()
-        try:
-            await generator.aclose()
-            logger.info(
-                f"[disconnect_guard] generator.aclose() succeeded, {chunk_count} chunks total, elapsed={_elapsed()}"
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[disconnect_guard] generator.aclose() raised {type(exc).__name__}: {exc}, "
-                f"{chunk_count} chunks total, elapsed={_elapsed()}"
-            )
+        if not monitor.done():
+            monitor.cancel()
         logger.info(
             f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
         )
