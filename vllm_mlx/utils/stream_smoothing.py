@@ -83,6 +83,51 @@ class SmoothingIterator:
             return "finish_reason" in choices[0]
         return False
 
+    @staticmethod
+    def _extract_tc_start(chunk: dict) -> tuple[str, str, int] | None:
+        """If chunk carries a tool call id+name delta, return (name, id, index).
+
+        These are first-tool-call chunks and must pass through immediately
+        so the client can render the tool name without waiting for args.
+        """
+        choices = chunk.get("choices", [])
+        if not choices or not isinstance(choices, list):
+            return None
+        delta = choices[0].get("delta", {})
+        tc_list = delta.get("tool_calls")
+        if not tc_list or not isinstance(tc_list, list):
+            return None
+        for tc in tc_list:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {})
+            if isinstance(fn, dict) and fn.get("name"):
+                return fn["name"], tc.get("id", ""), tc.get("index", 0)
+        return None
+
+    @staticmethod
+    def _extract_tc_arg(chunk: dict) -> tuple[str, int] | None:
+        """If chunk carries a tool call argument delta, return (arg_fragment, index).
+
+        These chunks should be buffered and emitted at the measured rate
+        instead of passing through instantly."""
+        choices = chunk.get("choices", [])
+        if not choices or not isinstance(choices, list):
+            return None
+        delta = choices[0].get("delta", {})
+        tc_list = delta.get("tool_calls")
+        if not tc_list or not isinstance(tc_list, list):
+            return None
+        for tc in tc_list:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {})
+            if isinstance(fn, dict) and "arguments" in fn and not fn.get("name"):
+                arg = fn["arguments"]
+                if arg is not None:
+                    return str(arg), tc.get("index", 0)
+        return None
+
     # ------------------------------------------------------------------
     # Emission
     # ------------------------------------------------------------------
@@ -137,6 +182,8 @@ class SmoothingIterator:
     async def __aiter__(self):
         # Each buffer item: (field, char, pre_rendered_sse)
         buffer: collections.deque[tuple[str, str, str]] = collections.deque()
+        # Tool call argument buffer: (arg_fragment, tc_index)
+        tc_buffer: collections.deque[tuple[str, int]] = collections.deque()
 
         # Arrival-time ring buffer for rolling rate measurement.
         # Stores (timestamp, char_count) for recent arrivals.
@@ -150,6 +197,9 @@ class SmoothingIterator:
         source_chunks = 0
         passthrough_chunks = 0
         emitted_chars = 0
+        tc_chunks = 0
+        pending_tc_start_raw: str | None = None
+        pending_tc_start_meta: str | None = None
         peak_buffer = 0
         sleep_ns = 0
         warmup_buffer_chars = 0
@@ -226,11 +276,24 @@ class SmoothingIterator:
 
                 if "[DONE]" in raw:
                     done = True
-                    while buffer:
-                        _, _, sse = buffer.popleft()
-                        if sse:
+                    while buffer or tc_buffer or pending_tc_start_raw is not None:
+                        if buffer:
+                            _, _, sse = buffer.popleft()
+                            if sse:
+                                _mark_emit()
+                                yield sse
+                        elif tc_buffer:
+                            if pending_tc_start_raw is not None:
+                                yield pending_tc_start_raw
+                                pending_tc_start_raw = None
+                                passthrough_chunks += 1
+                            arg_frag, tc_idx = tc_buffer.popleft()
                             _mark_emit()
-                            yield sse
+                            yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                        elif pending_tc_start_raw is not None:
+                            yield pending_tc_start_raw
+                            pending_tc_start_raw = None
+                            passthrough_chunks += 1
                     passthrough_chunks += 1
                     yield raw
                     continue
@@ -245,30 +308,58 @@ class SmoothingIterator:
                     template = dict(chunk)
 
                 if self._has_finish(chunk):
-                    while buffer:
-                        _, _, sse = buffer.popleft()
-                        if sse:
+                    while buffer or tc_buffer or pending_tc_start_raw is not None:
+                        if buffer:
+                            _, _, sse = buffer.popleft()
+                            if sse:
+                                _mark_emit()
+                                yield sse
+                        elif tc_buffer:
+                            if pending_tc_start_raw is not None:
+                                yield pending_tc_start_raw
+                                pending_tc_start_raw = None
+                                passthrough_chunks += 1
+                            arg_frag, tc_idx = tc_buffer.popleft()
                             _mark_emit()
-                            yield sse
+                            yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                        elif pending_tc_start_raw is not None:
+                            yield pending_tc_start_raw
+                            pending_tc_start_raw = None
+                            passthrough_chunks += 1
                     passthrough_chunks += 1
                     yield raw
                     continue
 
-                content, reasoning, tool_name = self._extract_text(chunk)
-                if tool_name:
-                    passthrough_chunks += 1
-                    yield raw
+                # --- Tool call handling ---
+                tc_start = self._extract_tc_start(chunk)
+                if tc_start is not None:
+                    # Don't yield yet — save for just-in-time emission
+                    # right before the first TC arg fragment so the
+                    # client never sees an empty "$ ..." component.
+                    pending_tc_start_raw = raw
+                    pending_tc_start_meta = tc_start[0]
                     continue
 
-                text = reasoning or content
-                field = "reasoning_content" if reasoning else "content"
-                if not text:
-                    passthrough_chunks += 1
-                    yield raw
-                    continue
+                tc_arg = self._extract_tc_arg(chunk)
+                if tc_arg is not None:
+                    # Argument fragment: buffer and drain at measured rate
+                    arg_fragment, tc_index = tc_arg
+                    _record_arrival(len(arg_fragment))
+                    tc_buffer.append((arg_fragment, tc_index))
+                    tc_chunks += 1
+                    peak_buffer = max(peak_buffer, len(tc_buffer) + len(buffer))
+                else:
+                    # --- Text/reasoning content ---
+                    content, reasoning, _ = self._extract_text(chunk)
+                    text = reasoning or content
+                    field = "reasoning_content" if reasoning else "content"
+                    if not text:
+                        passthrough_chunks += 1
+                        yield raw
+                        continue
 
-                # --- Buffer incoming text ---
-                _buffer_text(text, field)
+                    # --- Buffer incoming text ---
+                    _buffer_text(text, field)
 
                 elapsed = time.perf_counter() - start_time
 
@@ -279,7 +370,7 @@ class SmoothingIterator:
                 # --- Activate ---
                 if not warmed:
                     warmed = True
-                    warmup_buffer_chars = len(buffer)
+                    warmup_buffer_chars = len(buffer) + len(tc_buffer)
                     _maybe_recalc_interval()
                     logger.info(
                         "[STREAM-SMOOTH] activate warmup=%.2fs buffered=%d observed_cps=%.1f interval=%.2fms",
@@ -289,20 +380,41 @@ class SmoothingIterator:
                         _emit_interval * 1000.0,
                     )
 
-                # --- Drain buffer at measured rate ---
-                while buffer:
+                # --- Drain buffers at measured rate ---
+                drained_tc_last = False
+                while buffer or tc_buffer or pending_tc_start_raw is not None:
                     # Recalc rate periodically (every ~20 chars or when bucket
                     # overfills / underfills)
                     if len(buffer) % 20 == 0 or len(buffer) > self._max_bucket or len(buffer) < 4:
                         _maybe_recalc_interval()
 
-                    field, ch, sse = buffer.popleft()
-                    if sse:
-                        _mark_emit()
-                        yield sse
+                    # Emit pending TC start just-in-time before first TC arg
+                    if pending_tc_start_raw is not None and tc_buffer:
+                        yield pending_tc_start_raw
+                        pending_tc_start_raw = None
+                        passthrough_chunks += 1
 
-                    # If buffer ran dry, wait for more input (skip sleep)
-                    if not buffer:
+                    # Fair interleaving: alternate which buffer we drain from
+                    if drained_tc_last and buffer:
+                        field, ch, sse = buffer.popleft()
+                        drained_tc_last = False
+                        if sse:
+                            _mark_emit()
+                            yield sse
+                    elif tc_buffer:
+                        arg_frag, tc_idx = tc_buffer.popleft()
+                        drained_tc_last = True
+                        _mark_emit()
+                        yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
+                    elif buffer:
+                        field, ch, sse = buffer.popleft()
+                        drained_tc_last = False
+                        if sse:
+                            _mark_emit()
+                            yield sse
+
+                    # If nothing left to drain and no pending TC start, wait for more input
+                    if not buffer and not tc_buffer and pending_tc_start_raw is None:
                         break
 
                     # Pace emission at measured rate
@@ -312,12 +424,25 @@ class SmoothingIterator:
                         await asyncio.sleep(remaining)
                         sleep_ns += time.perf_counter_ns() - _sleep_start
 
-            # --- Source exhausted; drain remaining buffer ---
-            while buffer:
-                _, _, sse = buffer.popleft()
-                if sse:
+            # --- Source exhausted; drain remaining buffers ---
+            while buffer or tc_buffer or pending_tc_start_raw is not None:
+                if pending_tc_start_raw is not None and tc_buffer:
+                    yield pending_tc_start_raw
+                    pending_tc_start_raw = None
+                    passthrough_chunks += 1
+                if pending_tc_start_raw is not None and not buffer and not tc_buffer:
+                    yield pending_tc_start_raw
+                    pending_tc_start_raw = None
+                    passthrough_chunks += 1
+                if buffer:
+                    _, _, sse = buffer.popleft()
+                    if sse:
+                        _mark_emit()
+                        yield sse
+                elif tc_buffer:
+                    arg_frag, tc_idx = tc_buffer.popleft()
                     _mark_emit()
-                    yield sse
+                    yield self._build_tc_arg_sse(template, arg_frag, tc_idx)
 
             total_elapsed = time.perf_counter() - start_time
             emit_elapsed = (
@@ -327,12 +452,13 @@ class SmoothingIterator:
             )
             logger.info(
                 "[STREAM-SMOOTH] source_chunks=%d passthrough=%d input_chars=%d emitted_chars=%d "
-                "peak_buffer=%d warmup_buffer=%d emit_cps=%.1f total_cps=%.1f sleep=%.1fms warmup=%.2fs "
+                "tc_chunks=%d peak_buffer=%d warmup_buffer=%d emit_cps=%.1f total_cps=%.1f sleep=%.1fms warmup=%.2fs "
                 "rate_window=%.2fs max_bucket=%d",
                 source_chunks,
                 passthrough_chunks,
                 total_buffered,
                 emitted_chars,
+                tc_chunks,
                 peak_buffer,
                 warmup_buffer_chars,
                 emitted_chars / emit_elapsed if emit_elapsed > 0 else 0.0,

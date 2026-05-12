@@ -45,6 +45,8 @@ def build_ddtree_tree_from_topk(
     top_log_probs: np.ndarray,
     budget: int,
     min_cumulative_log_prob: float = float('-inf'),
+    max_depth: int = 0,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -54,7 +56,10 @@ def build_ddtree_tree_from_topk(
         budget: Maximum number of tree nodes (excluding root).
         min_cumulative_log_prob: Prune paths whose cumulative log-probability
             falls below this threshold.  Default ``-inf`` (no pruning).
-            Set to e.g. -15 to prune extremely unlikely branches.
+        max_depth: Maximum tree depth. 0 = unlimited. Caps the rank-0 chain
+            length so budget is spent on branching at shallow depths.
+        depth_penalty: Per-depth penalty added to child cumulative score.
+            Makes deeper nodes slightly less attractive. 0.0 = no penalty.
 
     Returns:
         DDTree with up to *budget* tree nodes.
@@ -124,9 +129,9 @@ def build_ddtree_tree_from_topk(
                 )
 
         # Push first child (rank 0 at next depth)
-        if depth < depth_limit:
+        if depth < depth_limit and (max_depth <= 0 or depth < max_depth):
             child_ranks = ranks + (0,)
-            child_logw = logw + float(top_log_probs[depth, 0])
+            child_logw = logw + float(top_log_probs[depth, 0]) + depth_penalty
             if child_logw >= min_cumulative_log_prob:
                 heapq.heappush(
                     heap,
@@ -206,6 +211,8 @@ def build_ddtree_tree_from_mlx_topk(
     budget: int,
     profile: dict | None = None,
     min_cumulative_log_prob: float = float('-inf'),
+    max_depth: int = 0,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build a DDTree from MLX top-k token IDs/log-probs.
 
@@ -246,6 +253,8 @@ def build_ddtree_tree_from_mlx_topk(
         top_log_probs=probs_np,
         budget=budget,
         min_cumulative_log_prob=min_cumulative_log_prob,
+        max_depth=max_depth,
+        depth_penalty=depth_penalty,
     )
     if profile is not None:
         _profile_add("heap_build_ns", time.perf_counter_ns() - _phase_start)
