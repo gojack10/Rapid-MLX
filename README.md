@@ -1,3 +1,20 @@
+# Fork: Jack ten Bosch  DDTree + DFlash Integration
+
+Fork of raullenchai/Rapid-MLX. I added:
+
+- DDTree speculative decoding as a verifier for DFlash
+  - Tree GDN nostate kernel with accepted-path recompute, depth cap with penalty wiring, log-softmax option, and draft-confidence pruning.
+  - My review: quality passes. DDTree is wired as an optional verifier behind DFlash.
+- DFlash-MLX engine adapter
+  - Checkpoint-based partial prefix restore, L2 fallback for cache misses, per-request telemetry.
+  - My review: prefix caching and live streaming work correctly.
+- CLI and runtime quality-of-life
+  - Repetition penalty, stream smoothing, temperature/top_p threading through DFlash, client disconnect cleanup.
+
+All DDTree and DFlash work lives on this branch. Not yet merged to upstream.
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/raullenchai/Rapid-MLX/main/docs/assets/logo.png" alt="Rapid-MLX" width="200">
 </p>
